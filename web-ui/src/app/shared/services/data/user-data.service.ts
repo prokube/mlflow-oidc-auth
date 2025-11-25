@@ -68,6 +68,6 @@ export class UserDataService {
   }
 
   deleteUser(body: UserModel) {
-    return this.http.delete<UserModel>(API_URL.DELETE_USER, { body });
+    return this.http.delete<UserModel>(API_URL.DELETE_USER(body.username));
   }
 }
