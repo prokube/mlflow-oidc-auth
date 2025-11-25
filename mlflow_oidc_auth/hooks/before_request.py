@@ -331,7 +331,9 @@ def _find_validator(req: Request) -> Optional[Callable[[], bool]]:
             None,
         )
     else:
-        return BEFORE_REQUEST_VALIDATORS.get((req.path, req.method))
+        # Use url_rule to match against route definitions with parameters
+        route_path = req.url_rule.rule if req.url_rule else req.path
+        return BEFORE_REQUEST_VALIDATORS.get((route_path, req.method))
 
 
 def before_request_hook():
