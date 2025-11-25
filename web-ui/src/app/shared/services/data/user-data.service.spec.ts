@@ -131,9 +131,8 @@ describe('UserDataService', () => {
       expect(user).toEqual(mockResponse);
     });
 
-    const req = httpMock.expectOne(API_URL.DELETE_USER);
+    const req = httpMock.expectOne(API_URL.DELETE_USER(mockUser.username));
     expect(req.request.method).toBe('DELETE');
-    expect(req.request.body).toEqual(mockUser);
     req.flush(mockResponse);
   });
 });

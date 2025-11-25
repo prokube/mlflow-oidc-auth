@@ -40,8 +40,7 @@ def get_user():
 
 
 @catch_mlflow_exception
-def delete_user():
-    username = get_request_param("username")
+def delete_user(username: str):
     store.delete_user(username)
     return jsonify({"message": f"Account {username} has been deleted"})
 
