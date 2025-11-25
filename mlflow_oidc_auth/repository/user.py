@@ -81,6 +81,22 @@ class UserRepository:
             user = get_user(session, username)
             if user is None:
                 raise MlflowException(f"User '{username}' not found.")
+            
+            # Delete all user permissions and group memberships before deleting the user
+            from mlflow_oidc_auth.db.models import (
+                SqlExperimentPermission,
+                SqlRegisteredModelPermission,
+                SqlExperimentRegexPermission,
+                SqlRegisteredModelRegexPermission,
+                SqlUserGroup,
+            )
+            
+            session.query(SqlExperimentPermission).filter_by(user_id=user.id).delete()
+            session.query(SqlRegisteredModelPermission).filter_by(user_id=user.id).delete()
+            session.query(SqlExperimentRegexPermission).filter_by(user_id=user.id).delete()
+            session.query(SqlRegisteredModelRegexPermission).filter_by(user_id=user.id).delete()
+            session.query(SqlUserGroup).filter_by(user_id=user.id).delete()
+            
             session.delete(user)
             session.flush()
 
