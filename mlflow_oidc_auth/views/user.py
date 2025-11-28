@@ -40,8 +40,7 @@ def get_user():
 
 
 @catch_mlflow_exception
-def delete_user():
-    username = get_request_param("username")
+def delete_user(username: str):
     store.delete_user(username)
     return jsonify({"message": f"Account {username} has been deleted"})
 
@@ -166,12 +165,12 @@ def list_user_prompts(username):
 @catch_mlflow_exception
 def list_users():
     service_account = bool(get_optional_request_param("service") or False)
-    # is_admin = get_is_admin()
-    # if is_admin:
-    #     users = [user.username for user in store.list_users()]
-    # else:
-    #     users = [get_username()]
-    users = [user.username for user in store.list_users(is_service_account=service_account)]
+    is_admin = get_is_admin()
+    if is_admin:
+        users = [user.username for user in store.list_users(is_service_account=service_account)]
+    else:
+        # Security fix: Non-admin users should only see themselves
+        users = [get_username()]
     return users
 
 
