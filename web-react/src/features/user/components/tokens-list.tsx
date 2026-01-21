@@ -110,6 +110,7 @@ export const TokensList: React.FC = () => {
           onClick={() => handleDeleteToken(token)}
           disabled={deletingTokenId === token.id}
           title={`Delete token "${token.name}"`}
+          variant="danger"
         />
       ),
       className: "w-20 text-center",
