@@ -1,12 +1,13 @@
 import React from "react";
 import type { IconDefinition } from "@fortawesome/free-solid-svg-icons";
-import { Button } from "./button";
+import { Button, type ButtonVariant } from "./button";
 
 interface IconButtonProps {
   icon: IconDefinition;
   onClick: (e: React.MouseEvent) => void;
   title?: string;
   disabled?: boolean;
+  variant?: ButtonVariant;
 }
 
 export function IconButton({
@@ -14,6 +15,7 @@ export function IconButton({
   onClick,
   title,
   disabled,
+  variant,
 }: IconButtonProps) {
   const handleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -29,6 +31,7 @@ export function IconButton({
       icon={icon}
       className="w-7 h-7"
       disabled={disabled}
+      variant={variant}
     />
   );
 }
