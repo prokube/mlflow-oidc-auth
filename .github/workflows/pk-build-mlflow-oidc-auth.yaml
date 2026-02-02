@@ -9,7 +9,7 @@ on:
   pull_request:
     paths:
       - 'mlflow_oidc_auth/**'
-      - 'web-ui/**'
+      - 'web-react/**'
       - 'pyproject.toml'
       - 'buildfiles/**'
       - '.github/workflows/build-mlflow-oidc-auth.yaml'
@@ -51,7 +51,7 @@ jobs:
 
           # Copy mlflow-oidc-auth source into docker build context
           cp -r mlflow_oidc_auth buildfiles/
-          cp -r web-ui buildfiles/
+          cp -r web-react buildfiles/
           cp pyproject.toml buildfiles/mlflow_oidc_auth_pyproject.toml
 
           LATEST_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:latest
