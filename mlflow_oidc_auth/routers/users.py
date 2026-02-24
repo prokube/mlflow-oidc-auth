@@ -147,7 +147,7 @@ async def create_access_token(
     summary="List users",
     description="Retrieves a list of users in the system.",
 )
-async def list_users(service: bool = False, username: str = Depends(get_username)) -> JSONResponse:
+async def list_users(service: bool = False, username: str = Depends(get_username), is_admin: bool = Depends(get_is_admin)) -> JSONResponse:
     """
     List users in the system.
 
@@ -178,6 +178,9 @@ async def list_users(service: bool = False, username: str = Depends(get_username
         # Use lightweight query that only fetches usernames,
         # avoiding eager loading of all permission relationships per user.
         users = store.list_usernames(is_service_account=service)
+        if not is_admin:
+            # Non-admin users can only see themselves
+            users = [u for u in users if u == username]
 
         return JSONResponse(content=users)
 
