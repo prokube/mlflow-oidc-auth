@@ -108,7 +108,7 @@ GROUP_GATEWAY_SECRET_PATTERN_PERMISSION_DETAIL = "/{group_name:path}/gateways/se
     response_model=GroupListResponse,
     tags=["groups"],
 )
-async def list_groups(username: str = Depends(get_username)) -> GroupListResponse:
+async def list_groups(username: str = Depends(get_username), is_admin: bool = Depends(get_is_admin)) -> GroupListResponse:
     """
     List all groups in the system.
 
@@ -133,6 +133,9 @@ async def list_groups(username: str = Depends(get_username)) -> GroupListRespons
         from mlflow_oidc_auth.store import store
 
         groups = store.get_groups()
+        if not is_admin:
+            # Non-admin users can only see groups they belong to
+            groups = store.get_groups_for_user(username)
         return GroupListResponse(root=groups)
 
     except Exception as e:
