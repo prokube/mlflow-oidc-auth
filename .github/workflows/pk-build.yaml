@@ -11,7 +11,7 @@ on:
 env:
   IMAGE_NAME: "mlflow-oidc-auth"
   IMAGE_PUSH_PATH: "${{ secrets.GCP_ARTIFACT_REGISTRY_PATH }}"
-  MLFLOW_COMMIT: "800fa8692f07264386fca2d8670d132474ecd5a2"
+  MLFLOW_VERSION: "800fa8692f07264386fca2d8670d132474ecd5a2"
 
 jobs:
   build:
@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Setup build dependencies
         run: |
@@ -36,13 +38,7 @@ jobs:
           echo "Starting parallel builds for MLflow and mlflow-oidc-auth..."
           (
             set -euo pipefail
-            mkdir -p mlflow-build
-            cd mlflow-build
-            git clone --filter=blob:none --no-checkout https://github.com/mlflow/mlflow.git .
-            git fetch --depth=1 origin ${MLFLOW_COMMIT}
-            git checkout FETCH_HEAD
-
-            cd mlflow-build/mlflow/server/js
+            cd mlflow-upstream/mlflow/server/js
             yarn install
             yarn build
 
@@ -84,7 +80,6 @@ jobs:
           cd /dist
           ls -lah
 
-          MLFLOW_VERSION=${MLFLOW_COMMIT}
           LATEST_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:latest
           COMMIT_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:commit-${{ github.sha }}
           MLFLOW_VERSION_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:mlflow-${MLFLOW_VERSION}
@@ -100,7 +95,7 @@ jobs:
           docker push $COMMIT_TAG
           docker push $MLFLOW_VERSION_TAG
           
-          If triggered by a git tag, also push with that tag name
+          # If triggered by a git tag, also push with that tag name
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             GIT_TAG="${{ github.ref_name }}"
             echo "Git tag detected: $GIT_TAG"
