@@ -29,27 +29,28 @@ jobs:
           npm install -g yarn
           pip install uv --break-system-packages
 
-      - name: Cache MLflow build artifacts
+      - name: Restore MLflow build cache
         id: cache-mlflow
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: dist/mlflow-*.tar.gz
           key: mlflow-build-${{ env.MLFLOW_VERSION }}
 
-      - name: Cache MLflow JS node_modules
+      - name: Restore MLflow JS node_modules cache
         if: steps.cache-mlflow.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: mlflow-upstream/mlflow/server/js/node_modules
           key: mlflow-js-${{ hashFiles('mlflow-upstream/mlflow/server/js/yarn.lock') }}
 
-      - name: Cache web-react node_modules
-        uses: actions/cache@v4
+      - name: Restore web-react node_modules cache
+        uses: actions/cache/restore@v4
         with:
           path: web-react/node_modules
           key: web-react-${{ hashFiles('web-react/yarn.lock') }}
 
       - name: Build MLflow from source
+        id: build-mlflow
         if: steps.cache-mlflow.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -64,6 +65,7 @@ jobs:
           cp dist/mlflow-*.tar.gz ../dist/
 
       - name: Build mlflow-oidc-auth
+        id: build-oidc-auth
         run: |
           set -euo pipefail
           cd web-react
@@ -72,6 +74,18 @@ jobs:
           cd ..
           uv sync --no-install-project --no-cache
           uv build
+
+      - name: Auth GCloud CLI
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Docker Login to Google Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: europe-west3-docker.pkg.dev
+          username: _json_key
+          password: ${{ secrets.GCP_SA_KEY }}
 
       - name: Create docker image with built wheels
         run: |
@@ -96,3 +110,24 @@ jobs:
             docker tag $LATEST_TAG ${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:$GIT_TAG
             docker push ${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:$GIT_TAG
           fi
+
+      - name: Save MLflow build cache
+        if: always() && steps.build-mlflow.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: dist/mlflow-*.tar.gz
+          key: mlflow-build-${{ env.MLFLOW_VERSION }}
+
+      - name: Save MLflow JS node_modules cache
+        if: always() && steps.build-mlflow.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: mlflow-upstream/mlflow/server/js/node_modules
+          key: mlflow-js-${{ hashFiles('mlflow-upstream/mlflow/server/js/yarn.lock') }}
+
+      - name: Save web-react node_modules cache
+        if: always() && steps.build-oidc-auth.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: web-react/node_modules
+          key: web-react-${{ hashFiles('web-react/yarn.lock') }}
