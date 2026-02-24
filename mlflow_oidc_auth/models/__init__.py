@@ -11,7 +11,6 @@ from mlflow_oidc_auth.models.experiment import (
     ExperimentRegexPermission,
     ExperimentSummary,
 )
-from mlflow_oidc_auth.models.gateway import GatewayPermission, GatewayRegexCreate
 from mlflow_oidc_auth.models.group import (
     GroupExperimentPermission,
     GroupExperimentPermissionItem,
@@ -22,7 +21,6 @@ from mlflow_oidc_auth.models.group import (
     GroupPromptRegexPermissionItem,
     GroupRegexPermission,
     GroupRegisteredModelRegexPermissionItem,
-    GroupGatewayRegexPermissionItem,
     GroupScorerPermissionItem,
     GroupScorerRegexPermissionItem,
     GroupUser,
@@ -48,11 +46,17 @@ from mlflow_oidc_auth.models.responses import (
     ScorerPermissionResponse,
     ScorerRegexPermissionRecord,
     ScorerRegexPermissionResponse,
-    UserGatewayRegexPermissionItem,
     StatusMessageResponse,
     StatusOnlyResponse,
 )
-from mlflow_oidc_auth.models.user import CreateAccessTokenRequest, CreateUserRequest
+from mlflow_oidc_auth.models.user import (
+    CreateAccessTokenRequest,
+    CreateUserRequest,
+    CreateUserTokenRequest,
+    UserTokenCreatedResponse,
+    UserTokenListResponse,
+    UserTokenResponse,
+)
 from mlflow_oidc_auth.models.webhook import (
     WebhookCreateRequest,
     WebhookListResponse,
@@ -89,10 +93,6 @@ __all__ = [
     "ScorerRegexCreate",
     "ScorerPermissionRequest",
     "ScorerSummary",
-    "GroupGatewayRegexPermissionItem",
-    "UserGatewayRegexPermissionItem",
-    "GatewayPermission",
-    "GatewayRegexCreate",
     "MessageResponse",
     "StatusOnlyResponse",
     "StatusMessageResponse",
@@ -113,6 +113,10 @@ __all__ = [
     "ScorerRegexPermissionResponse",
     "CreateAccessTokenRequest",
     "CreateUserRequest",
+    "CreateUserTokenRequest",
+    "UserTokenResponse",
+    "UserTokenCreatedResponse",
+    "UserTokenListResponse",
     "WebhookCreateRequest",
     "WebhookUpdateRequest",
     "WebhookTestRequest",
