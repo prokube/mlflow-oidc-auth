@@ -1,0 +1,133 @@
+name: Build prokube flavored MLflow OIDC Auth Image
+
+on:
+  push:
+    branches:
+      - 'pk-build'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: "mlflow-oidc-auth"
+  IMAGE_PUSH_PATH: "${{ secrets.GCP_ARTIFACT_REGISTRY_PATH }}"
+  MLFLOW_VERSION: "800fa8692f07264386fca2d8670d132474ecd5a2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Setup build dependencies
+        run: |
+          set -euo pipefail
+          # ubuntu-latest comes with pip and npm
+          npm install -g yarn
+          pip install uv --break-system-packages
+
+      - name: Restore MLflow build cache
+        id: cache-mlflow
+        uses: actions/cache/restore@v4
+        with:
+          path: dist/mlflow-*.tar.gz
+          key: mlflow-build-${{ env.MLFLOW_VERSION }}
+
+      - name: Restore MLflow JS node_modules cache
+        if: steps.cache-mlflow.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: mlflow-upstream/mlflow/server/js/node_modules
+          key: mlflow-js-${{ hashFiles('mlflow-upstream/mlflow/server/js/yarn.lock') }}
+
+      - name: Restore web-react node_modules cache
+        uses: actions/cache/restore@v4
+        with:
+          path: web-react/node_modules
+          key: web-react-${{ hashFiles('web-react/yarn.lock') }}
+
+      - name: Build MLflow from source
+        id: build-mlflow
+        if: steps.cache-mlflow.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cd mlflow-upstream/mlflow/server/js
+          yarn install --immutable
+          yarn build
+
+          cd ../../..
+          uv sync --frozen --no-install-project --no-cache
+          uv build
+          mkdir -p ../dist
+          cp dist/mlflow-*.tar.gz ../dist/
+
+      - name: Build mlflow-oidc-auth
+        id: build-oidc-auth
+        run: |
+          set -euo pipefail
+          cd web-react
+          yarn install --immutable
+          yarn build
+          cd ..
+          uv sync --no-install-project --no-cache
+          uv build
+
+      - name: Auth GCloud CLI
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Docker Login to Google Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: europe-west3-docker.pkg.dev
+          username: _json_key
+          password: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Create docker image with built wheels
+        run: |
+          set -euo pipefail
+
+          LATEST_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:latest
+          COMMIT_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:commit-${{ github.sha }}
+          MLFLOW_VERSION_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:mlflow-${MLFLOW_VERSION}
+
+          docker build --platform linux/amd64 -t $LATEST_TAG .
+
+          docker tag $LATEST_TAG $COMMIT_TAG
+          docker tag $LATEST_TAG $MLFLOW_VERSION_TAG
+          docker push $LATEST_TAG
+          docker push $COMMIT_TAG
+          docker push $MLFLOW_VERSION_TAG
+
+          # If triggered by a git tag, also push with that tag name
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            GIT_TAG="${{ github.ref_name }}"
+            echo "Git tag detected: $GIT_TAG"
+            docker tag $LATEST_TAG ${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:$GIT_TAG
+            docker push ${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:$GIT_TAG
+          fi
+
+      - name: Save MLflow build cache
+        if: always() && steps.build-mlflow.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: dist/mlflow-*.tar.gz
+          key: mlflow-build-${{ env.MLFLOW_VERSION }}
+
+      - name: Save MLflow JS node_modules cache
+        if: always() && steps.build-mlflow.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: mlflow-upstream/mlflow/server/js/node_modules
+          key: mlflow-js-${{ hashFiles('mlflow-upstream/mlflow/server/js/yarn.lock') }}
+
+      - name: Save web-react node_modules cache
+        if: always() && steps.build-oidc-auth.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: web-react/node_modules
+          key: web-react-${{ hashFiles('web-react/yarn.lock') }}
