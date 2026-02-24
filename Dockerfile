@@ -1,6 +1,6 @@
 ARG BASE_IMAGE=python:3.13-slim
 FROM ${BASE_IMAGE} AS builder
-COPY /dist /dist
+COPY dist /dist
 WORKDIR /dist
 
 RUN python3 -m venv .venv
