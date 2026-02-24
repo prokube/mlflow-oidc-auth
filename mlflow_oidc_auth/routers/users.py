@@ -116,7 +116,7 @@ async def create_access_token(
 
 
 @users_router.get(USERS_ROOT, summary="List users", description="Retrieves a list of users in the system.")
-async def list_users(service: bool = False, username: str = Depends(get_username)) -> JSONResponse:
+async def list_users(service: bool = False, username: str = Depends(get_username), is_admin: bool = Depends(get_is_admin)) -> JSONResponse:
     """
     List users in the system.
 
@@ -146,6 +146,9 @@ async def list_users(service: bool = False, username: str = Depends(get_username
 
         # Get users filtered by service account type
         users = [user.username for user in store.list_users(is_service_account=service)]
+        if not is_admin:
+            # Non-admin users can only see themselves
+            users = [u for u in users if u == username]
 
         return JSONResponse(content=users)
 
