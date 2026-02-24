@@ -29,72 +29,66 @@ jobs:
           npm install -g yarn
           pip install uv --break-system-packages
 
-          mkdir -p dists # Where the built wheels will be stored
+      - name: Cache MLflow build artifacts
+        id: cache-mlflow
+        uses: actions/cache@v4
+        with:
+          path: dist/mlflow-*.tar.gz
+          key: mlflow-build-${{ env.MLFLOW_VERSION }}
 
-      - name: Build MLflow from source & mlflow-oidc-auth in parallel
+      - name: Cache MLflow JS node_modules
+        if: steps.cache-mlflow.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: mlflow-upstream/mlflow/server/js/node_modules
+          key: mlflow-js-${{ hashFiles('mlflow-upstream/mlflow/server/js/yarn.lock') }}
+
+      - name: Cache web-react node_modules
+        uses: actions/cache@v4
+        with:
+          path: web-react/node_modules
+          key: web-react-${{ hashFiles('web-react/yarn.lock') }}
+
+      - name: Build MLflow from source
+        if: steps.cache-mlflow.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          mkdir -p dist
-          echo "Starting parallel builds for MLflow and mlflow-oidc-auth..."
-          (
-            set -euo pipefail
-            cd mlflow-upstream/mlflow/server/js
-            yarn install
-            yarn build
+          cd mlflow-upstream/mlflow/server/js
+          yarn install --immutable
+          yarn build
 
-            cd ../../..
-            uv sync --frozen --no-install-project --no-cache
-            uv build
-            cp dist/mlflow-*.tar.gz ../dist/
-          ) > /tmp/mlflow-build.log 2>&1 &
-          MLFLOW_PID=$!
+          cd ../../..
+          uv sync --frozen --no-install-project --no-cache
+          uv build
+          mkdir -p ../dist
+          cp dist/mlflow-*.tar.gz ../dist/
 
-          (
-            set -euo pipefail
-            cd web-react
-            yarn install
-            yarn build
-            cd ..
-            uv sync --no-install-project --no-cache
-            uv build
-          ) > /tmp/oidc-build.log 2>&1 &
-          OIDC_PID=$!
-
-          echo "Waiting for builds to complete..."
-          FAILED=0
-          wait $OIDC_PID || FAILED=1
-          wait $MLFLOW_PID || FAILED=1
-
-          echo "===== MLflow build log ====="
-          cat /tmp/mlflow-build.log
-          echo ""
-          echo "===== mlflow-oidc-auth build log ====="
-          cat /tmp/oidc-build.log
-
-          exit $FAILED
+      - name: Build mlflow-oidc-auth
+        run: |
+          set -euo pipefail
+          cd web-react
+          yarn install --immutable
+          yarn build
+          cd ..
+          uv sync --no-install-project --no-cache
+          uv build
 
       - name: Create docker image with built wheels
         run: |
           set -euo pipefail
-          mv Dockerfile /dist
-          cd /dist
-          ls -lah
 
           LATEST_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:latest
           COMMIT_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:commit-${{ github.sha }}
           MLFLOW_VERSION_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:mlflow-${MLFLOW_VERSION}
 
-          docker build --platform linux/amd64 \
-          -t $LATEST_TAG \
-          -f buildfiles/Dockerfile \
-          buildfiles/
-          
+          docker build --platform linux/amd64 -t $LATEST_TAG .
+
           docker tag $LATEST_TAG $COMMIT_TAG
           docker tag $LATEST_TAG $MLFLOW_VERSION_TAG
           docker push $LATEST_TAG
           docker push $COMMIT_TAG
           docker push $MLFLOW_VERSION_TAG
-          
+
           # If triggered by a git tag, also push with that tag name
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             GIT_TAG="${{ github.ref_name }}"
