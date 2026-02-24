@@ -1,0 +1,109 @@
+name: Build prokube flavored MLflow OIDC Auth Image
+
+on:
+  push:
+    branches:
+      - 'pk-build'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: "mlflow-oidc-auth"
+  IMAGE_PUSH_PATH: "${{ secrets.GCP_ARTIFACT_REGISTRY_PATH }}"
+  MLFLOW_COMMIT: "800fa8692f07264386fca2d8670d132474ecd5a2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup build dependencies
+        run: |
+          set -euo pipefail
+          # ubuntu-latest comes with pip and npm
+          npm install -g yarn
+          pip install uv --break-system-packages
+
+          mkdir -p dists # Where the built wheels will be stored
+
+      - name: Build MLflow from source & mlflow-oidc-auth in parallel
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          echo "Starting parallel builds for MLflow and mlflow-oidc-auth..."
+          (
+            set -euo pipefail
+            mkdir -p mlflow-build
+            cd mlflow-build
+            git clone --filter=blob:none --no-checkout https://github.com/mlflow/mlflow.git .
+            git fetch --depth=1 origin ${MLFLOW_COMMIT}
+            git checkout FETCH_HEAD
+
+            cd mlflow-build/mlflow/server/js
+            yarn install
+            yarn build
+
+            cd ../../..
+            uv sync --frozen --no-install-project --no-cache
+            uv build
+            cp dist/mlflow-*.tar.gz ../dist/
+          ) > /tmp/mlflow-build.log 2>&1 &
+          MLFLOW_PID=$!
+
+          (
+            set -euo pipefail
+            cd web-react
+            yarn install
+            yarn build
+            cd ..
+            uv sync --no-install-project --no-cache
+            uv build
+          ) > /tmp/oidc-build.log 2>&1 &
+          OIDC_PID=$!
+
+          echo "Waiting for builds to complete..."
+          FAILED=0
+          wait $OIDC_PID || FAILED=1
+          wait $MLFLOW_PID || FAILED=1
+
+          echo "===== MLflow build log ====="
+          cat /tmp/mlflow-build.log
+          echo ""
+          echo "===== mlflow-oidc-auth build log ====="
+          cat /tmp/oidc-build.log
+
+          exit $FAILED
+
+      - name: Create docker image with built wheels
+        run: |
+          set -euo pipefail
+          mv Dockerfile /dist
+          cd /dist
+          ls -lah
+
+          MLFLOW_VERSION=${MLFLOW_COMMIT}
+          LATEST_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:latest
+          COMMIT_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:commit-${{ github.sha }}
+          MLFLOW_VERSION_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:mlflow-${MLFLOW_VERSION}
+
+          docker build --platform linux/amd64 \
+          -t $LATEST_TAG \
+          -f buildfiles/Dockerfile \
+          buildfiles/
+          
+          docker tag $LATEST_TAG $COMMIT_TAG
+          docker tag $LATEST_TAG $MLFLOW_VERSION_TAG
+          docker push $LATEST_TAG
+          docker push $COMMIT_TAG
+          docker push $MLFLOW_VERSION_TAG
+          
+          If triggered by a git tag, also push with that tag name
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            GIT_TAG="${{ github.ref_name }}"
+            echo "Git tag detected: $GIT_TAG"
+            docker tag $LATEST_TAG ${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:$GIT_TAG
+            docker push ${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:$GIT_TAG
+          fi
