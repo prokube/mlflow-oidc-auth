@@ -17,6 +17,7 @@ from mlflow_oidc_auth.entities import (
     ScorerPermission,
     ScorerRegexPermission,
     User,
+    UserToken,
 )
 from mlflow_oidc_auth.entities.gateway_endpoint import GatewayEndpointGroupRegexPermission
 from mlflow_oidc_auth.entities.gateway_model_definition import GatewayModelDefinitionGroupRegexPermission
@@ -49,6 +50,7 @@ from mlflow_oidc_auth.repository import (
     GatewayModelDefinitionGroupPermissionRepository,
     GatewayModelDefinitionPermissionGroupRegexRepository,
     UserRepository,
+    UserTokenRepository,
 )
 
 
@@ -95,6 +97,9 @@ class SqlAlchemyStore:
         self.gateway_model_definition_group_repo = GatewayModelDefinitionGroupPermissionRepository(self.ManagedSessionMaker)
         self.gateway_model_definition_regex_repo = GatewayModelDefinitionPermissionRegexRepository(self.ManagedSessionMaker)
         self.gateway_model_definition_group_regex_repo = GatewayModelDefinitionPermissionGroupRegexRepository(self.ManagedSessionMaker)
+
+        # User tokens
+        self.user_token_repo = UserTokenRepository(self.ManagedSessionMaker)
 
     def ping(self) -> bool:
         """Lightweight database connectivity check for health probes.
@@ -211,10 +216,22 @@ class SqlAlchemyStore:
         return self.scorer_group_regex_repo.revoke(id=id, group_name=group_name)
 
     def authenticate_user(self, username: str, password: str) -> bool:
-        return self.user_repo.authenticate(username, password)
+        """Authenticate a user via the tokens table.
 
-    def create_user(self, username: str, password: str, display_name: str, is_admin: bool = False, is_service_account=False):
-        return self.user_repo.create(username, password, display_name, is_admin, is_service_account)
+        Checks the provided token against all non-expired tokens for the user.
+        Updates last_used_at timestamp on successful authentication.
+
+        Note: Legacy password_hash tokens are migrated to the tokens table
+        during database migration, so all authentication goes through this path.
+        """
+        return self.user_token_repo.authenticate(username, password)
+
+    def authenticate_user_token(self, username: str, token: str) -> bool:
+        """Alias for authenticate_user for clarity in token-based auth contexts."""
+        return self.user_token_repo.authenticate(username, token)
+
+    def create_user(self, username: str, display_name: str, is_admin: bool = False, is_service_account=False):
+        return self.user_repo.create(username, display_name, is_admin, is_service_account)
 
     def has_user(self, username: str) -> bool:
         return self.user_repo.exist(username)
@@ -237,21 +254,39 @@ class SqlAlchemyStore:
     def update_user(
         self,
         username: str,
-        password: Optional[str] = None,
-        password_expiration: Optional[datetime] = None,
         is_admin: Optional[bool] = None,
         is_service_account: Optional[bool] = None,
     ) -> User:
         return self.user_repo.update(
             username=username,
-            password=password,
-            password_expiration=password_expiration,
             is_admin=is_admin,
             is_service_account=is_service_account,
         )
 
     def delete_user(self, username: str):
         return self.user_repo.delete(username)
+
+    # User Token methods
+    def create_user_token(
+        self,
+        username: str,
+        name: str,
+        token: str,
+        expires_at: datetime,
+    ) -> UserToken:
+        return self.user_token_repo.create(username, name, token, expires_at)
+
+    def list_user_tokens(self, username: str) -> List[UserToken]:
+        return self.user_token_repo.list_for_user(username)
+
+    def get_user_token(self, token_id: int, username: str) -> UserToken:
+        return self.user_token_repo.get(token_id, username)
+
+    def delete_user_token(self, token_id: int, username: str) -> None:
+        return self.user_token_repo.delete(token_id, username)
+
+    def delete_all_user_tokens(self, username: str) -> int:
+        return self.user_token_repo.delete_all_for_user(username)
 
     def create_experiment_permission(self, experiment_id: str, username: str, permission: str) -> ExperimentPermission:
         return self.experiment_repo.grant_permission(experiment_id, username, permission)
