@@ -1,0 +1,182 @@
+name: Build prokube flavored MLflow OIDC Auth Image
+
+on:
+  pull_request:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  IMAGE_NAME: "mlflow-oidc-auth"
+  IMAGE_PUSH_PATH: "${{ secrets.GCP_ARTIFACT_REGISTRY_PATH }}"
+  DEV_IMAGE_PUSH_PATH: "${{ secrets.GCP_DEV_ARTIFACT_REGISTRY_PATH }}"
+  MLFLOW_COMMIT: 8ce990fac54f73fcb57ff557ded1347faea172a2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Stop workflow if trigger was tag push which is not on pk-main branch
+        id: validate-tag-push
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          git fetch origin pk-main
+          if ! git branch -r --contains HEAD | grep -q 'origin/pk-main'; then
+            echo "::error::Tag is not on pk-main branch. Stopping the workflow."
+            exit 1
+          fi
+
+      - name: Setup build dependencies
+        run: |
+          set -euo pipefail
+          # ubuntu-latest comes with pip and npm
+          npm install -g yarn
+          pip install uv --break-system-packages
+
+      - name: Restore MLflow build cache
+        id: cache-mlflow
+        uses: actions/cache/restore@v4
+        with:
+          path: dist/mlflow-*.tar.gz
+          key: mlflow-build-${{ env.MLFLOW_COMMIT }}
+
+      - name: Restore MLflow JS node_modules cache
+        if: steps.cache-mlflow.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: mlflow-upstream/mlflow/server/js/node_modules
+          key: mlflow-js-${{ hashFiles('mlflow-upstream/mlflow/server/js/yarn.lock') }}
+
+      - name: Restore web-react node_modules cache
+        uses: actions/cache/restore@v4
+        with:
+          path: web-react/node_modules
+          key: web-react-${{ hashFiles('web-react/yarn.lock') }}
+
+      - name: Build MLflow from source
+        id: build-mlflow
+        if: steps.cache-mlflow.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          git init mlflow-upstream
+          cd mlflow-upstream
+          git remote add origin https://github.com/mlflow/mlflow.git
+          git fetch --depth=1 --filter=blob:none origin ${{ env.MLFLOW_COMMIT }}
+          git checkout FETCH_HEAD
+
+          cd mlflow/server/js
+          yarn install --immutable
+          yarn build
+
+          cd ../../..
+          uv sync --frozen --no-install-project --no-cache
+          uv build
+          mkdir -p ../dist
+          cp dist/mlflow-*.tar.gz ../dist/
+
+      - name: Build mlflow-oidc-auth
+        id: build-oidc-auth
+        run: |
+          set -euo pipefail
+          cd web-react
+          yarn install --immutable
+          yarn build
+          cd ..
+          uv sync --no-install-project --no-cache
+          uv build
+
+      - name: Auth GCloud CLI
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Docker Login to Google Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: europe-west3-docker.pkg.dev
+          username: _json_key
+          password: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Build and push dev docker image
+        if: github.event_name == 'pull_request'
+        id: docker-build-dev
+        run: |
+          set -euo pipefail
+          # Build image tag
+          BRANCH_NAME="${{ github.head_ref }}"
+          COMMIT_SHORT=$(git rev-parse --short HEAD)
+
+          # Sanitize branch name (replace / and other invalid chars with -)
+          BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+          
+          # Generate datetime stamp
+          DATETIME=$(date -u +%Y%m%d-%H%M%S)
+
+          IMAGE_TAG=${{ env.DEV_IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${BRANCH_NAME}-${DATETIME}
+          COMMIT_TAG=${{ env.DEV_IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${COMMIT_SHORT}
+          docker build --platform linux/amd64 -t $IMAGE_TAG .
+          docker tag $IMAGE_TAG $COMMIT_TAG
+          docker push $IMAGE_TAG
+          docker push $COMMIT_TAG
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "commit_tag=$COMMIT_TAG" >> $GITHUB_OUTPUT
+
+      - name: Comment on PR with image tags
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --body "**Build succeeded!**
+
+          **Image tags:**
+          \`\`\`
+          ${{ steps.docker-build-dev.outputs.image_tag }}
+          ${{ steps.docker-build-dev.outputs.commit_tag }}
+          \`\`\`"
+
+      - name: Build and push prod docker image if pushed tag is on pk-main branch
+        id: docker-build-prod
+        if: startsWith(github.ref, 'refs/tags/') && steps.validate-tag-push.outcome == 'success'
+        run: |
+          set -euo pipefail
+          TAG=${GITHUB_REF#refs/tags/}
+          COMMIT=$(git rev-list -1 HEAD)
+
+          IMAGE_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${TAG}
+          LATEST_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:latest
+          COMMITS_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${COMMIT}-${{ env.MLFLOW_COMMIT }}
+
+          docker build --platform linux/amd64 -t $IMAGE_TAG .
+          docker tag $IMAGE_TAG $LATEST_TAG
+          docker tag $IMAGE_TAG $COMMITS_TAG
+          docker push $IMAGE_TAG
+          docker push $LATEST_TAG
+          docker push $COMMITS_TAG
+
+      - name: Save MLflow build cache
+        if: always() && steps.build-mlflow.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: dist/mlflow-*.tar.gz
+          key: mlflow-build-${{ env.MLFLOW_COMMIT }}
+
+      - name: Save MLflow JS node_modules cache
+        if: always() && steps.build-mlflow.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: mlflow-upstream/mlflow/server/js/node_modules
+          key: mlflow-js-${{ hashFiles('mlflow-upstream/mlflow/server/js/yarn.lock') }}
+
+      - name: Save web-react node_modules cache
+        if: always() && steps.build-oidc-auth.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: web-react/node_modules
+          key: web-react-${{ hashFiles('web-react/yarn.lock') }}
