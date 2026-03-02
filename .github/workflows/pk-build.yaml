@@ -22,6 +22,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Stop workflow if trigger was tag push which is not on pk-main branch
+        id: validate-tag-push
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          git fetch origin pk-main
+          if ! git branch -r --contains HEAD | grep -q 'origin/pk-main'; then
+            echo "::error::Tag is not on pk-main branch. Stopping the workflow."
+            exit 1
+          fi
+
       - name: Setup build dependencies
         run: |
           set -euo pipefail
@@ -94,8 +104,6 @@ jobs:
           username: _json_key
           password: ${{ secrets.GCP_SA_KEY }}
 
-      ### If PR
-      # build dev image and comment on PR with image tag for testing.
       - name: Build and push dev docker image
         if: github.event_name == "pull_request"
         id: docker-build-dev
@@ -132,25 +140,10 @@ jobs:
           ${{ steps.docker-build-dev.outputs.image_tag }}
           ${{ steps.docker-build-dev.outputs.commit_tag }}
           \`\`\`"
-        ### End If PR
 
-        ### If Tag
-        # Check if the pushed tag is on the pk-build branch. 
-        # Only build and push prod image if the tag is on the pk-build branch.
-      - name: Check if pushed tag is on pk-build branch
-        id: check-branch
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          git fetch origin pk-build
-          if git branch -r --contains HEAD | grep -q 'origin/pk-build'; then
-            echo "on_pk_build=true" >> $GITHUB_OUTPUT
-          else
-            echo "on_pk_build=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Build and push prod docker image if pushed tag is on pk-build branch
+      - name: Build and push prod docker image if pushed tag is on pk-main branch
         id: docker-build-prod
-        if: startsWith(github.ref, 'refs/tags/') && steps.check-branch.outputs.on_pk_build == 'true'
+        if: startsWith(github.ref, 'refs/tags/') && steps.validate-tag-push.outcome == 'success'
         run: |
           set -euo pipefail
           TAG=${GITHUB_REF#refs/tags/}
@@ -166,7 +159,6 @@ jobs:
           docker push $IMAGE_TAG
           docker push $LATEST_TAG
           docker push $COMMITS_TAG
-        ### End If Tag
 
       - name: Save MLflow build cache
         if: always() && steps.build-mlflow.outcome == 'success'
