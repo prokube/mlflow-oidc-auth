@@ -10,6 +10,7 @@ env:
   IMAGE_NAME: "mlflow-oidc-auth"
   IMAGE_PUSH_PATH: "${{ secrets.GCP_ARTIFACT_REGISTRY_PATH }}"
   DEV_IMAGE_PUSH_PATH: "${{ secrets.GCP_DEV_ARTIFACT_REGISTRY_PATH }}"
+  MLFLOW_COMMIT: 800fa8692f07264386fca2d8670d132474ecd5a2
 
 jobs:
   build:
@@ -20,17 +21,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Set MLFlow submodule commit
-        id: set-mlflow-commit
-        run: |
-          set -euo pipefail
-          # Get MLFlow commit from submodule and set as env variable for caching
-          cd mlflow-upstream
-          MLFLOW_COMMIT=$(git rev-parse HEAD)
-          echo "MLFLOW_COMMIT=$MLFLOW_COMMIT" >> $GITHUB_ENV
 
       - name: Setup build dependencies
         run: |
@@ -64,7 +54,14 @@ jobs:
         if: steps.cache-mlflow.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          cd mlflow-upstream/mlflow/server/js
+
+          git init mlflow-upstream
+          cd mlflow-upstream
+          git remote add origin https://github.com/mlflow/mlflow.git
+          git fetch --depth=1 --filter=blob:none origin ${{ env.MLFLOW_COMMIT }}
+          git checkout FETCH_HEAD
+
+          cd mlflow/server/js
           yarn install --immutable
           yarn build
 
