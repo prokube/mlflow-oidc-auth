@@ -3,16 +3,13 @@ name: Build prokube flavored MLflow OIDC Auth Image
 on:
   pull_request:
   push:
-    branches:
-      - 'pk-build'
     tags:
       - 'v*'
-  workflow_dispatch:
 
 env:
   IMAGE_NAME: "mlflow-oidc-auth"
   IMAGE_PUSH_PATH: "${{ secrets.GCP_ARTIFACT_REGISTRY_PATH }}"
-  MLFLOW_VERSION: "800fa8692f07264386fca2d8670d132474ecd5a2"
+  DEV_IMAGE_PUSH_PATH: "${{ secrets.GCP_DEV_ARTIFACT_REGISTRY_PATH }}"
 
 jobs:
   build:
@@ -26,6 +23,15 @@ jobs:
         with:
           submodules: true
 
+      - name: Set MLFlow submodule commit
+        id: set-mlflow-commit
+        run: |
+          set -euo pipefail
+          # Get MLFlow commit from submodule and set as env variable for caching
+          cd mlflow-upstream
+          MLFLOW_COMMIT=$(git rev-parse HEAD)
+          echo "MLFLOW_COMMIT=$MLFLOW_COMMIT" >> $GITHUB_ENV
+
       - name: Setup build dependencies
         run: |
           set -euo pipefail
@@ -38,7 +44,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: dist/mlflow-*.tar.gz
-          key: mlflow-build-${{ env.MLFLOW_VERSION }}
+          key: mlflow-build-${{ env.MLFLOW_COMMIT }}
 
       - name: Restore MLflow JS node_modules cache
         if: steps.cache-mlflow.outputs.cache-hit != 'true'
@@ -91,55 +97,31 @@ jobs:
           username: _json_key
           password: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Create docker image with built wheels
-        id: docker-build
+      ### If PR
+      # build dev image and comment on PR with image tag for testing.
+      - name: Build and push dev docker image
+        if: github.event_name == "pull_request"
+        id: docker-build-dev
         run: |
           set -euo pipefail
-
-          # Determine branch name (head_ref for PRs, ref_name for pushes)
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            BRANCH_NAME="${{ github.head_ref }}"
-          else
-            BRANCH_NAME="${{ github.ref_name }}"
-          fi
+          # Build image tag
+          BRANCH_NAME="${{ github.head_ref }}"
+          COMMIT_SHORT=$(git rev-parse --short HEAD)
 
           # Sanitize branch name (replace / and other invalid chars with -)
           BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
-
+          
           # Generate datetime stamp
           DATETIME=$(date -u +%Y%m%d-%H%M%S)
 
-          # Build image tags
-          BRANCH_DATETIME_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${BRANCH_NAME}-${DATETIME}
-          BRANCH_LATEST_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${BRANCH_NAME}-latest
-
-          docker build --platform linux/amd64 -t $BRANCH_DATETIME_TAG .
-
-          docker tag $BRANCH_DATETIME_TAG $BRANCH_LATEST_TAG
-          docker push $BRANCH_DATETIME_TAG
-          docker push $BRANCH_LATEST_TAG
-
-          echo "Pushed image: $BRANCH_DATETIME_TAG"
-          echo "Pushed image: $BRANCH_LATEST_TAG"
-
-          # Export tags for PR comment
-          echo "datetime_tag=${BRANCH_DATETIME_TAG}" >> $GITHUB_OUTPUT
-          echo "latest_tag=${BRANCH_LATEST_TAG}" >> $GITHUB_OUTPUT
-
-          # For pushes to pk-build or version tags, also push latest and version tags
-          if [[ "${{ github.ref }}" == "refs/heads/pk-build" ]]; then
-            LATEST_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:latest
-            docker tag $BRANCH_DATETIME_TAG $LATEST_TAG
-            docker push $LATEST_TAG
-            echo "Pushed image: $LATEST_TAG"
-          fi
-
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            GIT_TAG="${{ github.ref_name }}"
-            echo "Git tag detected: $GIT_TAG"
-            docker tag $BRANCH_DATETIME_TAG ${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:$GIT_TAG
-            docker push ${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:$GIT_TAG
-          fi
+          IMAGE_TAG=${{ env.DEV_IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${BRANCH_NAME}-${DATETIME}
+          COMMIT_TAG=${{ env.DEV_IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${COMMIT_SHORT}
+          docker build --platform linux/amd64 -t $IMAGE_TAG .
+          docker tag $IMAGE_TAG $COMMIT_TAG
+          docker push $IMAGE_TAG
+          docker push $COMMIT_TAG
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "commit_tag=$COMMIT_TAG" >> $GITHUB_OUTPUT
 
       - name: Comment on PR with image tags
         if: github.event_name == 'pull_request'
@@ -150,16 +132,51 @@ jobs:
 
           **Image tags:**
           \`\`\`
-          ${{ steps.docker-build.outputs.datetime_tag }}
-          ${{ steps.docker-build.outputs.latest_tag }}
+          ${{ steps.docker-build-dev.outputs.image_tag }}
+          ${{ steps.docker-build-dev.outputs.commit_tag }}
           \`\`\`"
+        ### End If PR
+
+        ### If Tag
+        # Check if the pushed tag is on the pk-build branch. 
+        # Only build and push prod image if the tag is on the pk-build branch.
+      - name: Check if pushed tag is on pk-build branch
+        id: check-branch
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          git fetch origin pk-build
+          if git branch -r --contains HEAD | grep -q 'origin/pk-build'; then
+            echo "on_pk_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "on_pk_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push prod docker image if pushed tag is on pk-build branch
+        id: docker-build-prod
+        if: startsWith(github.ref, 'refs/tags/') && steps.check-branch.outputs.on_pk_build == 'true'
+        run: |
+          set -euo pipefail
+          TAG=${GITHUB_REF#refs/tags/}
+          COMMIT=$(git rev-list -1 HEAD)
+
+          IMAGE_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${TAG}
+          LATEST_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:latest
+          COMMITS_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${COMMIT}-${{ env.MLFLOW_COMMIT }}
+
+          docker build --platform linux/amd64 -t $IMAGE_TAG .
+          docker tag $IMAGE_TAG $LATEST_TAG
+          docker tag $IMAGE_TAG $COMMITS_TAG
+          docker push $IMAGE_TAG
+          docker push $LATEST_TAG
+          docker push $COMMITS_TAG
+        ### End If Tag
 
       - name: Save MLflow build cache
         if: always() && steps.build-mlflow.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: dist/mlflow-*.tar.gz
-          key: mlflow-build-${{ env.MLFLOW_VERSION }}
+          key: mlflow-build-${{ env.MLFLOW_COMMIT }}
 
       - name: Save MLflow JS node_modules cache
         if: always() && steps.build-mlflow.outcome == 'success'
