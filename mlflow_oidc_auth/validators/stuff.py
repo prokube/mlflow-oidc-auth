@@ -115,15 +115,11 @@ def validate_can_create_gateway(username: str) -> bool:
 def validate_gateway_proxy(username: str) -> bool:
     """Validate gateway proxy requests.
 
-    This attempts to extract a gateway identifier from the request and
-    enforce READ for GET requests and UPDATE for POST (create/update).
-
-    When no explicit gateway name can be extracted, it falls back to
-    checking whether the user has the required capability on any gateway.
+    MLflow only reads ``gateway_path``: POST must name an endpoint and needs UPDATE on it,
+    otherwise it is denied. A GET is the endpoint listing and is always allowed, because
+    denying it makes the UI show a false "Permission Denied" on page load.
     """
 
-    from mlflow_oidc_auth.store import store
-    from mlflow_oidc_auth.permissions import get_permission
     from mlflow_oidc_auth.utils.permissions import can_use_gateway_endpoint, can_update_gateway_endpoint
 
     def _extract_gateway_name():
@@ -166,17 +162,12 @@ def validate_gateway_proxy(username: str) -> bool:
 
     # Map HTTP method to required capability
     if request.method == "GET":
-        # USE. A GET is the endpoint listing: _validate_gateway_path requires the path to
-        # be exactly "api/2.0/endpoints", so it names no single endpoint and the
-        # any-endpoint check below is the gate. Note the proxied listing itself is NOT
-        # filtered per-tenant — gateway-proxy is a plain Flask route, so it has no
-        # AFTER_REQUEST_HANDLERS entry (that map is built from proto endpoints only).
-        # That exposure is pre-existing and tracked separately.
+        # The endpoint listing names no endpoint and the UI fetches it on page load, so it is
+        # allowed. The proxied listing is NOT filtered per-tenant; it is empty unless
+        # MLFLOW_DEPLOYMENTS_TARGET is set.
         if gateway_name:
             return can_use_gateway_endpoint(str(gateway_name), username)
-        # Fallback: check if user has any gateway endpoint with use
-        perms = store.list_gateway_endpoint_permissions(username)
-        return any(get_permission(p.permission).can_use for p in perms)
+        return True
     else:
         # POST -> UPDATE required
         if gateway_name:

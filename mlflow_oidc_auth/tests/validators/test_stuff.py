@@ -128,43 +128,14 @@ class TestValidateGatewayProxy:
             mock_store.list_gateway_endpoint_permissions.return_value = [perm]
             assert validate_gateway_proxy("alice") is False
 
-    def test_get_names_no_endpoint_and_falls_back_to_any_use(self, flask_app: Flask) -> None:
-        """A GET is the endpoint listing; _validate_gateway_path forbids naming one."""
-        perm = MagicMock()
-        perm.permission = "EDIT"
+    def test_get_listing_allowed_without_endpoint_permissions(self, flask_app: Flask) -> None:
+        """The UI fetches this listing on mount; denying it shows a false "Permission Denied" toast."""
         with (
-            flask_app.test_request_context("/?gateway_path=api/2.0/endpoints", method="GET"),
-            patch("mlflow_oidc_auth.store.store") as mock_store,
-        ):
-            mock_store.list_gateway_endpoint_permissions.return_value = [perm]
-            assert validate_gateway_proxy("alice") is True
-        mock_store.list_gateway_endpoint_permissions.assert_called_once_with("alice")
-
-    def test_get_fallback_any_gateway_with_use(self, flask_app: Flask) -> None:
-        """GET without explicit name falls back to listing all endpoint permissions."""
-        perm = MagicMock()
-        perm.permission = "EDIT"
-
-        with (
-            flask_app.test_request_context("/", method="GET"),
-            patch("mlflow_oidc_auth.store.store") as mock_store,
-        ):
-            mock_store.list_gateway_endpoint_permissions.return_value = [perm]
-            result = validate_gateway_proxy("alice")
-
-        assert result is True
-        mock_store.list_gateway_endpoint_permissions.assert_called_once_with("alice")
-
-    def test_get_fallback_no_permissions(self, flask_app: Flask) -> None:
-        """GET without explicit name returns False when user has no endpoint permissions."""
-        with (
-            flask_app.test_request_context("/", method="GET"),
+            flask_app.test_request_context("/?gateway_path=api/2.0/endpoints/", method="GET"),
             patch("mlflow_oidc_auth.store.store") as mock_store,
         ):
             mock_store.list_gateway_endpoint_permissions.return_value = []
-            result = validate_gateway_proxy("nobody")
-
-        assert result is False
+            assert validate_gateway_proxy("nobody") is True
 
 
 # ---------------------------------------------------------------------------
