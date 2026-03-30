@@ -115,10 +115,13 @@ def validate_gateway_proxy(username: str) -> bool:
     """Validate gateway proxy requests.
 
     This attempts to extract a gateway identifier from the request and
-    enforce READ for GET requests and UPDATE for POST (create/update).
+    enforce USE for GET requests and UPDATE for POST/PUT/DELETE.
 
-    When no explicit gateway name can be extracted, it falls back to
-    checking whether the user has the required capability on any gateway.
+    For GET requests without an explicit gateway name, access is allowed
+    unconditionally because upstream will return an empty result set for
+    users with no permissions. For mutating requests without a gateway
+    name, it falls back to checking whether the user has UPDATE on any
+    gateway.
     """
 
     from mlflow_oidc_auth.store import store
@@ -146,9 +149,10 @@ def validate_gateway_proxy(username: str) -> bool:
         # USE
         if gateway_name:
             return can_use_gateway_endpoint(str(gateway_name), username)
-        # Fallback: check if user has any gateway endpoint with use
-        perms = store.list_gateway_endpoint_permissions(username)
-        return any(get_permission(p.permission).can_use for p in perms)
+        # No gateway name — allow the request. Upstream returns an empty
+        # result set for users with no permissions. Denying here would
+        # cause the UI to falsely show "Permission Denied".
+        return True
     else:
         # POST/PUT/DELETE -> UPDATE required
         if gateway_name:

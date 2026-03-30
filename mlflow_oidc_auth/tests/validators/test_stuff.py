@@ -107,31 +107,13 @@ class TestValidateGatewayProxy:
         assert result is False
         mock_upd.assert_called_once_with("locked-ep", "bob")
 
-    def test_get_fallback_any_gateway_with_use(self, flask_app: Flask) -> None:
-        """GET without explicit name falls back to listing all endpoint permissions."""
-        perm = MagicMock()
-        perm.permission = "EDIT"
-
+    def test_get_without_endpoint_name_allowed(self, flask_app: Flask) -> None:
+        """GET without explicit name returns True as upstream will return empty result set, which is the expected behavior for a user with no permissions."""
         with (
-            flask_app.test_request_context("/", method="GET"),
-            patch("mlflow_oidc_auth.store.store") as mock_store,
+            flask_app.test_request_context("/", method="GET")
         ):
-            mock_store.list_gateway_endpoint_permissions.return_value = [perm]
-            result = validate_gateway_proxy("alice")
-
-        assert result is True
-        mock_store.list_gateway_endpoint_permissions.assert_called_once_with("alice")
-
-    def test_get_fallback_no_permissions(self, flask_app: Flask) -> None:
-        """GET without explicit name returns False when user has no endpoint permissions."""
-        with (
-            flask_app.test_request_context("/", method="GET"),
-            patch("mlflow_oidc_auth.store.store") as mock_store,
-        ):
-            mock_store.list_gateway_endpoint_permissions.return_value = []
             result = validate_gateway_proxy("nobody")
-
-        assert result is False
+        assert result is True
 
     def test_post_fallback_any_gateway_with_update(self, flask_app: Flask) -> None:
         """POST without explicit name checks update capability on all endpoint permissions."""
