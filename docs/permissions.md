@@ -173,6 +173,7 @@ For workspace-specific permission behavior, see [Workspaces](workspaces).
 Key points:
 - Workspace permissions serve a dual role: workspace access control **and** resource-level fallback
 - When workspaces are enabled, `DEFAULT_MLFLOW_PERMISSION` is not used as a resource fallback — workspace permissions take that role
+- With `MLFLOW_ENABLE_WORKSPACES=true` and `OIDC_WORKSPACE_DEFAULT_PERMISSION=EDIT`, users can update existing experiments/models through workspace fallback but cannot create new experiments/models (creation requires workspace `MANAGE`)
 - All workspace-isolated resources (experiments, models, webhooks, trash) are automatically scoped to the active workspace
 
 ## Configuration
@@ -182,7 +183,7 @@ Key points:
 PERMISSION_SOURCE_ORDER=user,group,regex,group-regex
 
 # Default permission when no explicit permission found (workspaces disabled)
-DEFAULT_MLFLOW_PERMISSION=MANAGE
+DEFAULT_MLFLOW_PERMISSION=NO_PERMISSIONS
 ```
 
 ### Common Configurations
@@ -200,6 +201,68 @@ DEFAULT_MLFLOW_PERMISSION=READ
 PERMISSION_SOURCE_ORDER=regex,group-regex,user,group
 DEFAULT_MLFLOW_PERMISSION=READ
 ```
+
+## Migrating to deny-by-default
+
+> **The shipped `DEFAULT_MLFLOW_PERMISSION` changes from `MANAGE` to `NO_PERMISSIONS` in the next major version** ([#293](https://github.com/mlflow-oidc/mlflow-oidc-auth/issues/293)).
+
+### What changes, and for whom
+
+`DEFAULT_MLFLOW_PERMISSION` decides access when a resource has **no** user, group, regex or group-regex grant. Today it ships as `MANAGE`, so a fresh install is open by default: every authenticated user can read, edit and delete every experiment and registered model until grants exist.
+
+You are affected only if **all** of the following hold:
+
+- you do **not** set `DEFAULT_MLFLOW_PERMISSION` explicitly, **and**
+- workspaces are disabled (`MLFLOW_ENABLE_WORKSPACES=false`), **and**
+- some users reach resources through the fallback rather than through a grant
+
+With workspaces enabled the global default is not used as a resource fallback at all — workspace permissions take that role — so workspace deployments are unaffected.
+
+### Pinning current behaviour
+
+If you want no change at all, set the value explicitly before upgrading:
+
+```bash
+DEFAULT_MLFLOW_PERMISSION=MANAGE
+```
+
+This is supported and will keep working. The change is to the *default*, not to the option.
+
+### Migrating properly (recommended)
+
+**1. Find out how much access is coming from the fallback.** Every permission decision made by the default is logged, and grants are warned about:
+
+```
+WARNING DEFAULT_MLFLOW_PERMISSION granted MANAGE on experiment=12 to alice
+        because no explicit permission exists (1 such grants for experiment so far)
+```
+
+Warnings are throttled (occurrences 1, 10, 100, 1000, …), so treat them as a signal to investigate, not a count. Enable `DEBUG` logging to see every occurrence with its resource and user.
+
+**2. Create the grants those users actually need.** For each resource that showed up, grant explicitly — to a user, a group, or a name-regex rule. Group and regex grants scale better than per-user ones:
+
+```bash
+# via the UI:  Permissions → Experiments / Models
+# or the REST API under /oidc/api/
+```
+
+**3. Verify with the default already lowered**, in staging:
+
+```bash
+DEFAULT_MLFLOW_PERMISSION=NO_PERMISSIONS
+```
+
+Anything still reachable is reachable because of a real grant. Anything that breaks was relying on the fallback and needs a grant from step 2.
+
+**4. Upgrade.** With the value set explicitly, or with the grants in place, the new default is a no-op for you.
+
+### If you upgrade without migrating
+
+Users lose access to resources they had no explicit grant for, and see `403`. Nothing is deleted and no permission records change — set `DEFAULT_MLFLOW_PERMISSION=MANAGE` to restore the previous behaviour immediately while you work through the steps above.
+
+### Why this is changing
+
+Open-by-default is a reasonable *adoption* choice — install the plugin and nothing breaks — but it is the wrong default for a plugin whose purpose is multi-tenant isolation. It also silently defeats `RESTRICT_RESOURCE_CREATION`: with a permissive default, that flag denies nothing (the plugin now warns at startup when this combination is configured).
 
 ## Examples
 
@@ -264,3 +327,32 @@ Sources checked:
   5. Workspace fallback: diana has READ on "data-team"
 Result: READ (from workspace fallback)
 ```
+
+## Resource Creation Authorization
+
+By default, any authenticated user can create experiments and registered models — this matches upstream MLflow. Because the resource does not exist yet at creation time, the usual per-resource permission (keyed by experiment id or model name) cannot apply, so creation was historically unguarded.
+
+Set `RESTRICT_RESOURCE_CREATION=true` to require **EDIT** (`can_update`) or higher to create a resource. Since the resource is new, only **name-based** sources are consulted:
+
+1. `regex` — the user's own regex patterns matched against the new resource name
+2. `group-regex` — the user's groups' regex patterns matched against the new resource name
+3. Fallback when neither matches:
+   - **Workspaces disabled** → the global `DEFAULT_MLFLOW_PERMISSION`
+   - **Workspaces enabled** → the user's permission on the request workspace (deny if they have none)
+
+> ⚠️ **The default `DEFAULT_MLFLOW_PERMISSION` is `MANAGE`, which grants `can_update`.** In a non-workspace deployment, enabling `RESTRICT_RESOURCE_CREATION` alone does **nothing** — a name that matches no regex falls back to `MANAGE` and creation is still allowed. To actually restrict creation you must either lower `DEFAULT_MLFLOW_PERMISSION` below `EDIT` (e.g. `NO_PERMISSIONS`) so only regex/group-regex matches can create, or rely on the workspace gate. Setting the flag without doing one of these gives a false sense of lockdown.
+
+This closes a real gap in non-workspace deployments: with a project-prefix scheme like `<project>/<name>`, a user granted `^team-a/.*` could still create `team-b/whatever` (e.g. via a typo) and end up owning a resource they cannot subsequently access.
+
+### Interaction with workspaces
+
+When workspaces are enabled, creation is *also* subject to the workspace creation gate (workspace `MANAGE`, plus `OIDC_WORKSPACE_REQUIRE_CREATION_CONTEXT` / `OIDC_WORKSPACE_DENY_DEFAULT_CREATION`). The two checks compose as **AND** — a create must satisfy *both*. Enabling `RESTRICT_RESOURCE_CREATION` therefore never grants more than the workspace gate alone; it only ever adds restriction. If you run with workspaces, the workspace gate is the primary control and `RESTRICT_RESOURCE_CREATION` is optional.
+
+### Affected endpoints
+
+| Endpoint | Effect when restricted |
+|----------|------------------------|
+| `CreateExperiment` | Requires EDIT+ for the new experiment name |
+| `CreateRegisteredModel` | Requires EDIT+ for the new model name |
+
+Child resources (`CreateRun`, `CreateModelVersion`, …) are unaffected — they inherit permission from their parent.

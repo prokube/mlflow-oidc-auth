@@ -1,17 +1,24 @@
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
+from mlflow.exceptions import MlflowException
 
 from mlflow_oidc_auth.audit import emit_audit_event
+from mlflow_oidc_auth.constants import DEFAULT_TOKEN_NAME
 from mlflow_oidc_auth.dependencies import check_admin_permission
 from mlflow_oidc_auth.logger import get_logger
 from mlflow_oidc_auth.models import (
     CreateAccessTokenRequest,
     CreateUserRequest,
+    CreateUserTokenRequest,
     CurrentUserProfile,
     GroupRecord,
+    UserTokenCreatedResponse,
+    UserTokenListResponse,
+    UserTokenResponse,
 )
 from mlflow_oidc_auth.store import store
 from mlflow_oidc_auth.user import create_user, generate_token
@@ -33,8 +40,13 @@ users_router = APIRouter(
 
 USERS_ROOT = ""
 CREATE_ACCESS_TOKEN = "/access-token"
+USER_OWNERSHIP = "/ownership"
 CURRENT_USER = "/current"
 USERNAME = "/{username}"
+TOKENS = "/tokens"
+TOKEN_BY_ID = "/tokens/{token_id}"
+USER_TOKENS = "/{username}/tokens"
+USER_TOKEN_BY_ID = "/{username}/tokens/{token_id}"
 
 
 @users_router.patch(
@@ -52,6 +64,9 @@ async def create_access_token(
 
     This endpoint creates a new access token for the authenticated user.
     Optionally accepts expiration date and username (if different from current user).
+
+    Note: This endpoint maintains backwards compatibility by rotating the "default"
+    token. For managing multiple named tokens, use the /tokens endpoints.
 
     Parameters:
     -----------
@@ -87,42 +102,40 @@ async def create_access_token(
         else:
             target_username = current_username
 
-        # Parse expiration date if provided
-        expiration = None
+        # Parse expiration date if provided, otherwise default to 1 year
         if token_request and token_request.expiration:
-            expiration_str = token_request.expiration
-            # Handle ISO 8601 with 'Z' (UTC) at the end
-            if expiration_str.endswith("Z"):
-                expiration_str = expiration_str[:-1] + "+00:00"
+            expiration = _parse_expiration(token_request.expiration)
+        else:
+            # Default to 1 year expiration for legacy API compatibility
+            expiration = datetime.now(timezone.utc) + timedelta(days=365)
 
-            try:
-                expiration = datetime.fromisoformat(expiration_str)
-                now = datetime.now(timezone.utc)
-
-                if expiration < now:
-                    raise HTTPException(status_code=400, detail="Expiration date must be in the future")
-
-                if expiration > now + timedelta(days=366):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Expiration date must be less than 1 year in the future",
-                    )
-            except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid expiration date format")
-
-        # Check if the target user exists
-        user = store.get_user_profile(target_username)
+        # Check if the target user exists. get_user_profile raises rather than returning None,
+        # so without this the outer handler turns a mistyped username into a 500 (issue #338).
+        try:
+            user = store.get_user_profile(target_username)
+        except MlflowException:
+            raise HTTPException(status_code=404, detail=f"User {target_username} not found")
         if user is None:
             raise HTTPException(status_code=404, detail=f"User {target_username} not found")
 
-        # Generate new token and update user
+        # Delete existing default token if it exists (rotate behavior)
+        existing_tokens = store.list_user_tokens(target_username)
+        for token in existing_tokens:
+            if token.name == DEFAULT_TOKEN_NAME:
+                store.delete_user_token(token.id, target_username)
+                break
+
+        # Generate and store new token
         new_token = generate_token()
-        store.update_user(username=target_username, password=new_token, password_expiration=expiration)
+        store.create_user_token(username=target_username, name=DEFAULT_TOKEN_NAME, token=new_token, expires_at=expiration)
         emit_audit_event(
             "user.token_rotate",
             actor=current_username,
             resource_type="user",
             resource_id=target_username,
+            detail={
+                "expiration": expiration.isoformat(),
+            },
         )
 
         return JSONResponse(
@@ -137,9 +150,8 @@ async def create_access_token(
         raise
     except Exception as e:
         # Log unexpected errors and return a generic error response
-
         logger.error(f"Error creating access token: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to create access token")
+        raise HTTPException(status_code=500, detail="Failed to create access token")
 
 
 @users_router.get(
@@ -249,6 +261,59 @@ async def create_new_user(
         raise HTTPException(status_code=500, detail=f"Failed to create user")
 
 
+@users_router.patch(
+    USER_OWNERSHIP,
+    summary="Change which source owns a user",
+    description="Sets a user's managed_by. Admins only. This is the break-glass path when a directory is decommissioned.",
+)
+async def set_user_ownership(
+    username: str = Body(..., description="The user whose ownership is being changed"),
+    managed_by: str = Body(..., description="The new owner: 'manual', 'scim', or 'oidc:<provider-id>'"),
+    admin_username: str = Depends(check_admin_permission),
+) -> JSONResponse:
+    """Hand a user row to a different source (issue #319).
+
+    The guard's whole failure mode is lockout, and lockout is only survivable if an
+    administrator can undo it *without* database access. That is what this is: an explicit,
+    audited administrator write, permitted in every enforcement mode.
+
+    The common case is a directory being decommissioned — its rows are set back to ``manual``
+    and become editable again. ``mlflow-oidc db reconcile-ownership`` does the same thing in
+    bulk, for an operator who does have a shell.
+
+    Parameters:
+        username: The user whose ownership is being changed.
+        managed_by: The new owner.
+        admin_username: The authenticated administrator (injected).
+
+    Returns:
+        JSONResponse: What changed.
+
+    Raises:
+        HTTPException: 400 if the owner is not one a source presents, 404 if there is no such
+            user.
+    """
+    if not re.fullmatch(r"manual|scim|oidc:[A-Za-z0-9._-]+", managed_by or ""):
+        raise HTTPException(status_code=400, detail="managed_by must be 'manual', 'scim', or 'oidc:<provider-id>'")
+
+    try:
+        store.get_user_profile(username)
+    except MlflowException:
+        raise HTTPException(status_code=404, detail=f"User {username} not found")
+
+    previous = store.get_user_profile(username).managed_by
+    store.update_user(username=username, managed_by=managed_by, written_by="manual", admin_override=True)
+    emit_audit_event(
+        "user.ownership_set",
+        actor=admin_username,
+        resource_type="user",
+        resource_id=username,
+        detail={"from": previous, "to": managed_by},
+    )
+    logger.info("Administrator %s set ownership of %s from %s to %s", admin_username, username, previous, managed_by)
+    return JSONResponse(content={"username": username, "managed_by": managed_by, "previous": previous}, status_code=200)
+
+
 @users_router.delete(
     USERS_ROOT,
     summary="Delete a user",
@@ -283,8 +348,9 @@ async def delete_user(
     """
     try:
         # Check if user exists before attempting deletion
-        user = store.get_user_profile(username)
-        if not user:
+        try:
+            store.get_user_profile(username)
+        except MlflowException:
             raise HTTPException(status_code=404, detail=f"User {username} not found")
 
         # Delete the user
@@ -344,12 +410,148 @@ async def get_current_user_information(
             display_name=user.display_name,
             is_admin=bool(user.is_admin),
             is_service_account=bool(user.is_service_account),
-            password_expiration=user.password_expiration.isoformat() if user.password_expiration else None,
             groups=[GroupRecord(**g.to_json()) for g in (user.groups or [])],
         )
     except Exception as e:
         logger.error(f"Error getting current user information: {str(e)}")
         raise HTTPException(status_code=404, detail="User not found")
+
+
+# =============================================================================
+# Token Management Endpoints (Multi-Token API)
+# =============================================================================
+# NOTE: These routes MUST be defined BEFORE the /{username} route below,
+# otherwise FastAPI will match /tokens as a username parameter.
+
+
+def _token_to_response(token) -> UserTokenResponse:
+    """Convert a UserToken entity to a response model."""
+    return UserTokenResponse(
+        id=token.id,
+        name=token.name,
+        created_at=token.created_at.isoformat(),
+        expires_at=token.expires_at.isoformat(),
+        last_used_at=token.last_used_at.isoformat() if token.last_used_at else None,
+    )
+
+
+def _parse_expiration(expiration_str: str) -> datetime:
+    """Parse and validate an expiration date string.
+
+    Expiration is required and must be no more than 1 year in the future.
+    """
+    if not expiration_str:
+        raise HTTPException(status_code=400, detail="Expiration date is required")
+
+    # Handle ISO 8601 with 'Z' (UTC) at the end
+    if expiration_str.endswith("Z"):
+        expiration_str = expiration_str[:-1] + "+00:00"
+
+    try:
+        expiration = datetime.fromisoformat(expiration_str)
+        if expiration.tzinfo is None:
+            expiration = expiration.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+
+        if expiration < now:
+            raise HTTPException(status_code=400, detail="Expiration date must be in the future")
+
+        if expiration > now + timedelta(days=366):
+            raise HTTPException(status_code=400, detail="Expiration date must be less than 1 year in the future")
+
+        return expiration
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid expiration date format")
+
+
+@users_router.get(
+    TOKENS,
+    response_model=UserTokenListResponse,
+    summary="List user tokens",
+    description="List all tokens for the authenticated user.",
+)
+async def list_tokens(current_username: str = Depends(get_username)) -> UserTokenListResponse:
+    """List all tokens for the authenticated user."""
+    try:
+        tokens = store.list_user_tokens(current_username)
+        return UserTokenListResponse(tokens=[_token_to_response(t) for t in tokens])
+    except Exception as e:
+        logger.error(f"Error listing tokens: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to list tokens")
+
+
+@users_router.post(
+    TOKENS,
+    response_model=UserTokenCreatedResponse,
+    status_code=201,
+    summary="Create a named token",
+    description="Create a new named token for the authenticated user.",
+)
+async def create_token(
+    token_request: CreateUserTokenRequest,
+    current_username: str = Depends(get_username),
+) -> UserTokenCreatedResponse:
+    """Create a new named token for the authenticated user."""
+    try:
+        expiration = _parse_expiration(token_request.expiration)
+
+        # Generate and store new token
+        new_token = generate_token()
+        created = store.create_user_token(
+            username=current_username,
+            name=token_request.name,
+            token=new_token,
+            expires_at=expiration,
+        )
+
+        return UserTokenCreatedResponse(
+            id=created.id,
+            name=created.name,
+            token=new_token,  # Only shown once at creation
+            created_at=created.created_at.isoformat() if created.created_at else None,
+            expires_at=created.expires_at.isoformat(),
+            message=f"Token '{token_request.name}' created successfully",
+        )
+    except HTTPException:
+        raise
+    except MlflowException as e:
+        if e.error_code == "RESOURCE_ALREADY_EXISTS":
+            raise HTTPException(status_code=409, detail=f"Token with name '{token_request.name}' already exists")
+        logger.error(f"Error creating token: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create token")
+    except Exception as e:
+        logger.error(f"Error creating token: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create token")
+
+
+@users_router.delete(
+    TOKEN_BY_ID,
+    summary="Delete a token",
+    description="Delete a specific token by ID.",
+)
+async def delete_token(
+    token_id: int,
+    current_username: str = Depends(get_username),
+) -> JSONResponse:
+    """Delete a specific token by ID."""
+    try:
+        store.delete_user_token(token_id, current_username)
+        return JSONResponse(content={"message": "Token deleted successfully"})
+    except MlflowException as e:
+        if e.error_code == "RESOURCE_DOES_NOT_EXIST":
+            raise HTTPException(status_code=404, detail=f"Token with id={token_id} not found")
+        logger.error(f"Error deleting token: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to delete token")
+    except Exception as e:
+        logger.error(f"Error deleting token: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to delete token")
+
+
+# =============================================================================
+# User Information Endpoint (with path parameter)
+# =============================================================================
+# NOTE: This route MUST be defined AFTER all specific routes like /tokens,
+# /tokens/{token_id}, etc. to avoid catching them as username values.
 
 
 @users_router.get(
@@ -390,9 +592,115 @@ async def get_user_information(username: str, admin_username: str = Depends(chec
             display_name=user.display_name,
             is_admin=bool(user.is_admin),
             is_service_account=bool(user.is_service_account),
-            password_expiration=user.password_expiration.isoformat() if user.password_expiration else None,
             groups=[GroupRecord(**g.to_json()) for g in (user.groups or [])],
         )
     except Exception as e:
         logger.error(f"Error getting user information for {username}: {str(e)}")
         raise HTTPException(status_code=404, detail="User not found")
+
+
+# =============================================================================
+# Admin Token Management Endpoints
+# =============================================================================
+
+
+@users_router.get(
+    USER_TOKENS,
+    response_model=UserTokenListResponse,
+    summary="List user tokens (admin)",
+    description="List all tokens for a specific user. Admin only.",
+)
+async def list_user_tokens_admin(
+    username: str,
+    admin_username: str = Depends(check_admin_permission),
+) -> UserTokenListResponse:
+    """List all tokens for a specific user (admin only)."""
+    try:
+        # Verify user exists
+        try:
+            store.get_user_profile(username)
+        except MlflowException:
+            raise HTTPException(status_code=404, detail=f"User {username} not found")
+
+        tokens = store.list_user_tokens(username)
+        return UserTokenListResponse(tokens=[_token_to_response(t) for t in tokens])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing tokens for user {username}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to list tokens")
+
+
+@users_router.post(
+    USER_TOKENS,
+    response_model=UserTokenCreatedResponse,
+    status_code=201,
+    summary="Create token for user (admin)",
+    description="Create a new named token for a specific user. Admin only.",
+)
+async def create_user_token_admin(
+    username: str,
+    token_request: CreateUserTokenRequest,
+    admin_username: str = Depends(check_admin_permission),
+) -> UserTokenCreatedResponse:
+    """Create a new named token for a specific user (admin only)."""
+    try:
+        # Verify user exists
+        try:
+            store.get_user_profile(username)
+        except MlflowException:
+            raise HTTPException(status_code=404, detail=f"User {username} not found")
+
+        expiration = _parse_expiration(token_request.expiration)
+
+        # Generate and store new token
+        new_token = generate_token()
+        created = store.create_user_token(
+            username=username,
+            name=token_request.name,
+            token=new_token,
+            expires_at=expiration,
+        )
+
+        return UserTokenCreatedResponse(
+            id=created.id,
+            name=created.name,
+            token=new_token,
+            created_at=created.created_at.isoformat() if created.created_at else None,
+            expires_at=created.expires_at.isoformat(),
+            message=f"Token '{token_request.name}' created for user '{username}'",
+        )
+    except HTTPException:
+        raise
+    except MlflowException as e:
+        if e.error_code == "RESOURCE_ALREADY_EXISTS":
+            raise HTTPException(status_code=409, detail=f"Token with name '{token_request.name}' already exists for user '{username}'")
+        logger.error(f"Error creating token for user {username}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create token")
+    except Exception as e:
+        logger.error(f"Error creating token for user {username}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create token")
+
+
+@users_router.delete(
+    USER_TOKEN_BY_ID,
+    summary="Delete user token (admin)",
+    description="Delete a specific token for a user. Admin only.",
+)
+async def delete_user_token_admin(
+    username: str,
+    token_id: int,
+    admin_username: str = Depends(check_admin_permission),
+) -> JSONResponse:
+    """Delete a specific token for a user (admin only)."""
+    try:
+        store.delete_user_token(token_id, username)
+        return JSONResponse(content={"message": f"Token deleted successfully for user '{username}'"})
+    except MlflowException as e:
+        if e.error_code == "RESOURCE_DOES_NOT_EXIST":
+            raise HTTPException(status_code=404, detail=f"Token with id={token_id} not found for user '{username}'")
+        logger.error(f"Error deleting token for user {username}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to delete token")
+    except Exception as e:
+        logger.error(f"Error deleting token for user {username}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to delete token")

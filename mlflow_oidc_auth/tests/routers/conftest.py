@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from mlflow.exceptions import MlflowException
+from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -70,12 +72,17 @@ def mock_store():
     """Mock the store module with comprehensive user and permission data."""
     store_mock = MagicMock()
 
+    # Server-side sessions (#310). A bare MagicMock return would be *truthy*, so a request with
+    # no cookie would resolve to a mock "session" and look authenticated. Default to no session;
+    # a test that wants one sets this explicitly.
+    store_mock.resolve_auth_session.return_value = None
+    store_mock.create_auth_session.return_value = "sid-mock"
+    store_mock.revoke_auth_session.return_value = True
+
     # Mock users
     admin_user = User(
         id_=1,
         username="admin@example.com",
-        password_hash="admin_token_hash",
-        password_expiration=None,
         is_admin=True,
         is_service_account=False,
         display_name="Admin User",
@@ -84,8 +91,6 @@ def mock_store():
     regular_user = User(
         id_=2,
         username="user@example.com",
-        password_hash="user_token_hash",
-        password_expiration=None,
         is_admin=False,
         is_service_account=False,
         display_name="Regular User",
@@ -94,8 +99,6 @@ def mock_store():
     service_user = User(
         id_=3,
         username="service@example.com",
-        password_hash="service_token_hash",
-        password_expiration=None,
         is_admin=False,
         is_service_account=True,
         display_name="Service Account",
@@ -109,7 +112,10 @@ def mock_store():
     }.get(username)
 
     def _get_user_profile(username: str):
-        return store_mock.get_user(username)
+        result = store_mock.get_user(username)
+        if result is None:
+            raise MlflowException(f"User '{username}' not found", RESOURCE_DOES_NOT_EXIST)
+        return result
 
     store_mock.get_user_profile.side_effect = _get_user_profile
 
@@ -121,7 +127,14 @@ def mock_store():
         "user@example.com",
         "service@example.com",
     ]
-    store_mock.create_user.return_value = True
+    store_mock.create_user.return_value = User(
+        id_=99,
+        username="newuser@example.com",
+        is_admin=False,
+        is_service_account=False,
+        display_name="New User",
+    )
+    store_mock.create_user_token.return_value = MagicMock(id=1, name="default")
     store_mock.update_user.return_value = None
     store_mock.delete_user.return_value = None
 
@@ -291,6 +304,17 @@ def mock_config():
     config_mock.OIDC_GROUP_NAME = ["user-group", "test-group"]
     config_mock.OIDC_GEN_AI_GATEWAY_ENABLED = False
     config_mock.MLFLOW_ENABLE_WORKSPACES = False
+
+    # A real registry, not a MagicMock: since #316 the callback looks the provider up here and
+    # then uses its id and issuer. A mock would hand those paths a MagicMock where a string is
+    # required, which fails in ways that say nothing about the case under test.
+    from mlflow_oidc_auth.provider_registry import ProviderConfig, RegistryLoadResult
+
+    config_mock.AUTH_PROVIDERS = RegistryLoadResult(
+        providers=[ProviderConfig(id="default", type="oidc", display_name="Test Provider", audience="mlflow")],
+        errors=[],
+        source="legacy",
+    )
     return config_mock
 
 
@@ -354,6 +378,11 @@ def _patch_router_stores(mock_store):
     patches = [
         patch("mlflow_oidc_auth.store.store", mock_store),
         patch("mlflow_oidc_auth.utils.request_helpers_fastapi.store", mock_store),
+        # The auth router binds ``store`` at import, so patching the singleton does not reach it.
+        # Without this the OIDC callback opens a *real* session row against whatever database
+        # the lazy singleton last pointed at — which passes in isolation and fails when the
+        # whole suite shares a process.
+        patch("mlflow_oidc_auth.routers.auth.store", mock_store),
         patch("mlflow_oidc_auth.utils.batch_permissions.store", mock_store),
         patch("mlflow_oidc_auth.routers.registered_model_permissions.store", mock_store),
         patch("mlflow_oidc_auth.routers.user_permissions.store", mock_store),
@@ -654,6 +683,7 @@ def test_app_admin(mock_store, mock_oauth, mock_config, mock_tracking_store, adm
             "mlflow_oidc_auth.routers.scorers_permissions.check_scorer_manage_permission",
             MagicMock(return_value=None),
         ),
+        patch("mlflow_oidc_auth.user.store", mock_store),
     ]
 
     for p in patches:
