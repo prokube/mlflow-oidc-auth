@@ -112,7 +112,7 @@ async def create_access_token(
         # Check if the target user exists. get_user_profile raises rather than returning None,
         # so without this the outer handler turns a mistyped username into a 500 (issue #338).
         try:
-            user = store.get_user_profile(target_username)
+            user = _ensure_local_tokens_allowed(target_username)
         except MlflowException:
             raise HTTPException(status_code=404, detail=f"User {target_username} not found")
         if user is None:
@@ -464,6 +464,14 @@ def _parse_expiration(expiration_str: str) -> datetime:
         raise HTTPException(status_code=400, detail="Invalid expiration date format")
 
 
+def _ensure_local_tokens_allowed(username: str):
+    """Refuse local credentials for identities that must re-pass workload policy per request."""
+    profile = store.get_user_profile(username)
+    if isinstance(profile.managed_by, str) and profile.managed_by.startswith("spiffe:"):
+        raise HTTPException(status_code=403, detail="SPIFFE workload identities cannot create local access tokens")
+    return profile
+
+
 @users_router.get(
     TOKENS,
     response_model=UserTokenListResponse,
@@ -493,6 +501,7 @@ async def create_token(
 ) -> UserTokenCreatedResponse:
     """Create a new named token for the authenticated user."""
     try:
+        _ensure_local_tokens_allowed(current_username)
         expiration = _parse_expiration(token_request.expiration)
 
         # Generate and store new token
@@ -647,7 +656,7 @@ async def create_user_token_admin(
     try:
         # Verify user exists
         try:
-            store.get_user_profile(username)
+            _ensure_local_tokens_allowed(username)
         except MlflowException:
             raise HTTPException(status_code=404, detail=f"User {username} not found")
 

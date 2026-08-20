@@ -331,7 +331,33 @@ def _claims_options_for(provider) -> dict | None:
         options["aud"] = {"essential": True, "value": provider.audience}
     if provider.issuer:
         options["iss"] = {"essential": True, "value": provider.issuer}
+    if provider.type == "spiffe":
+        options["sub"] = {"essential": True}
+        options["exp"] = {"essential": True}
     return options or None
+
+
+def _applicable_jwks(provider, jwks: dict) -> dict:
+    """Restrict SPIFFE validation to keys explicitly marked for JWT-SVID use."""
+    if provider.type != "spiffe":
+        return jwks
+    keys = jwks.get("keys") if isinstance(jwks, dict) else None
+    applicable = [key for key in keys or [] if isinstance(key, dict) and key.get("use") == "jwt-svid"]
+    if not applicable:
+        raise ValueError(f"Provider '{provider.id}' published no key with use 'jwt-svid'")
+    # Authlib implements the standard JOSE ``use`` values and refuses anything except ``sig``
+    # for verification. SPIFFE deliberately defines ``jwt-svid`` instead. Select on the exact
+    # SPIFFE value first, then remove only that metadata from copies offered to the decoder.
+    return {"keys": [{name: value for name, value in key.items() if name != "use"} for key in applicable]}
+
+
+def _validate_required_spiffe_claims(provider, payload) -> None:
+    """Defend explicitly against JWT libraries treating absent optional claims as valid."""
+    if provider.type != "spiffe":
+        return
+    for claim in ("sub", "aud", "exp"):
+        if claim not in payload:
+            raise ValueError(f"SPIFFE JWT-SVID carries no {claim!r} claim")
 
 
 def _jwt_for(provider) -> JsonWebToken:
@@ -367,16 +393,18 @@ def validate_token(token: str):
     decoder = _jwt_for(provider)
 
     try:
-        jwks = _get_provider_jwks(provider)
+        jwks = _applicable_jwks(provider, _get_provider_jwks(provider))
         payload = decoder.decode(token, jwks, claims_options=claims_options)
         payload.validate()
+        _validate_required_spiffe_claims(provider, payload)
         return payload
     except BadSignatureError as e:
         logger.error("Token validation failed with bad signature for provider %s: %s", provider.id, str(e))
         # Refresh *this* provider's keys and retry once, for key rotation.
-        jwks = _get_provider_jwks(provider, force_refresh=True)
+        jwks = _applicable_jwks(provider, _get_provider_jwks(provider, force_refresh=True))
         payload = decoder.decode(token, jwks, claims_options=claims_options)
         payload.validate()
+        _validate_required_spiffe_claims(provider, payload)
         return payload
     except Exception as e:
         logger.error("Unexpected error during token validation: %s", str(e))

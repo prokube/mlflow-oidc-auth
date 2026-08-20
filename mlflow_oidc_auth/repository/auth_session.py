@@ -39,12 +39,14 @@ class ResolvedSession:
         is_admin: Whether that user is an administrator.
         is_active: Whether the account may authenticate.
         expires_at: When the session stops being valid.
+        managed_by: Source that owns the user row, used to reject workload sessions.
     """
 
     username: str
     is_admin: bool
     is_active: bool
     expires_at: Optional[datetime] = None
+    managed_by: str = "manual"
 
 
 def _now() -> datetime:
@@ -111,7 +113,7 @@ class AuthSessionRepository:
             return None
         with self._Session() as session:
             row = (
-                session.query(SqlUser.username, SqlUser.is_admin, SqlUser.active, SqlAuthSession.expires_at)
+                session.query(SqlUser.username, SqlUser.is_admin, SqlUser.active, SqlAuthSession.expires_at, SqlUser.managed_by)
                 .join(SqlAuthSession, SqlAuthSession.user_id == SqlUser.id)
                 .filter(
                     SqlAuthSession.session_id == session_id,
@@ -122,7 +124,7 @@ class AuthSessionRepository:
             )
             if row is None:
                 return None
-            return ResolvedSession(username=row[0], is_admin=bool(row[1]), is_active=bool(row[2]), expires_at=row[3])
+            return ResolvedSession(username=row[0], is_admin=bool(row[1]), is_active=bool(row[2]), expires_at=row[3], managed_by=row[4])
 
     def revoke(self, session_id: str) -> bool:
         """Revoke one session. Returns True if it was live until now.

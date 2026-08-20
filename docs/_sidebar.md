@@ -3,6 +3,7 @@
 - [Installation](installation)
 - [Configuration](configuration)
 - [Kubernetes Service Accounts](kubernetes-auth)
+- [SPIFFE Workload Identities](spiffe-auth)
 - [Configuration Providers](configuration-providers)
 - [Permissions](permissions)
 - [Workspaces](workspaces)
