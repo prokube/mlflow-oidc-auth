@@ -86,7 +86,7 @@ class TestListUsersEndpoint:
             "bob@example.com",
         ]
         with patch("mlflow_oidc_auth.store.store", mock_store):
-            result = await list_users(username="test@example.com")
+            result = await list_users(username="test@example.com", is_admin=True)
 
         assert isinstance(result.body, bytes)
         # Verify store was called with correct parameters
@@ -97,7 +97,7 @@ class TestListUsersEndpoint:
         """Test listing service accounts only."""
         mock_store.list_usernames.return_value = ["svc@example.com"]
         with patch("mlflow_oidc_auth.store.store", mock_store):
-            result = await list_users(service=True, username="test@example.com")
+            result = await list_users(service=True, username="test@example.com", is_admin=True)
 
         # Verify store was called with service account filter
         mock_store.list_usernames.assert_called_once_with(is_service_account=True)
@@ -109,10 +109,22 @@ class TestListUsersEndpoint:
 
         with patch("mlflow_oidc_auth.store.store", mock_store):
             with pytest.raises(HTTPException) as exc_info:
-                await list_users(username="test@example.com")
+                await list_users(username="test@example.com", is_admin=True)
 
         assert exc_info.value.status_code == 500
         assert "Failed to retrieve users" in str(exc_info.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_list_users_non_admin_only_sees_self(self, mock_store):
+        """Non-admin users cannot enumerate other accounts."""
+        mock_store.list_usernames.return_value = [
+            "alice@example.com",
+            "bob@example.com",
+        ]
+        with patch("mlflow_oidc_auth.store.store", mock_store):
+            result = await list_users(username="alice@example.com", is_admin=False)
+
+        assert result.body == b'["alice@example.com"]'
 
     def test_list_users_integration(self, authenticated_client):
         """Test list users endpoint through FastAPI test client."""

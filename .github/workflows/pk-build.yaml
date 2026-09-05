@@ -8,19 +8,19 @@ on:
 
 env:
   IMAGE_NAME: "mlflow-oidc-auth"
-  IMAGE_PUSH_PATH: "${{ secrets.GCP_ARTIFACT_REGISTRY_PATH }}"
-  DEV_IMAGE_PUSH_PATH: "${{ secrets.GCP_DEV_ARTIFACT_REGISTRY_PATH }}"
-  MLFLOW_COMMIT: 8ce990fac54f73fcb57ff557ded1347faea172a2
+  # MLflow v3.16.0
+  MLFLOW_COMMIT: 998f7103eb5bb305491aa6e661e3862af0a8a8ed
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Stop workflow if trigger was tag push which is not on pk-main branch
         id: validate-tag-push
@@ -93,57 +93,30 @@ jobs:
           uv build
 
       - name: Auth GCloud CLI
+        if: startsWith(github.ref, 'refs/tags/')
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Docker Login to Google Artifact Registry
+        if: startsWith(github.ref, 'refs/tags/')
         uses: docker/login-action@v3
         with:
           registry: europe-west3-docker.pkg.dev
           username: _json_key
           password: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Build and push dev docker image
+      - name: Build pull-request docker image
         if: github.event_name == 'pull_request'
-        id: docker-build-dev
         run: |
           set -euo pipefail
-          # Build image tag
-          BRANCH_NAME="${{ github.head_ref }}"
-          COMMIT_SHORT=$(git rev-parse --short HEAD)
-
-          # Sanitize branch name (replace / and other invalid chars with -)
-          BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
-          
-          # Generate datetime stamp
-          DATETIME=$(date -u +%Y%m%d-%H%M%S)
-
-          IMAGE_TAG=${{ env.DEV_IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${BRANCH_NAME}-${DATETIME}
-          COMMIT_TAG=${{ env.DEV_IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${COMMIT_SHORT}
-          docker build --platform linux/amd64 -t $IMAGE_TAG .
-          docker tag $IMAGE_TAG $COMMIT_TAG
-          docker push $IMAGE_TAG
-          docker push $COMMIT_TAG
-          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "commit_tag=$COMMIT_TAG" >> $GITHUB_OUTPUT
-
-      - name: Comment on PR with image tags
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh pr comment ${{ github.event.pull_request.number }} --body "**Build succeeded!**
-
-          **Image tags:**
-          \`\`\`
-          ${{ steps.docker-build-dev.outputs.image_tag }}
-          ${{ steps.docker-build-dev.outputs.commit_tag }}
-          \`\`\`"
+          docker build --platform linux/amd64 -t ${{ env.IMAGE_NAME }}:ci-${{ github.sha }} .
 
       - name: Build and push prod docker image if pushed tag is on pk-main branch
         id: docker-build-prod
         if: startsWith(github.ref, 'refs/tags/') && steps.validate-tag-push.outcome == 'success'
+        env:
+          IMAGE_PUSH_PATH: ${{ secrets.GCP_ARTIFACT_REGISTRY_PATH }}
         run: |
           set -euo pipefail
           TAG=${GITHUB_REF#refs/tags/}

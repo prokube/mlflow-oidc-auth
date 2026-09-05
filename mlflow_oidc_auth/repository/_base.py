@@ -18,7 +18,7 @@ from mlflow.protos.databricks_pb2 import (
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound, NoResultFound
 from sqlalchemy.orm import Session
 
-from mlflow_oidc_auth.db.models import SqlGroup, SqlUser
+from mlflow_oidc_auth.db.models import SqlGroup, SqlUser, SqlUserGroup
 from mlflow_oidc_auth.permissions import _validate_permission, compare_permissions
 from mlflow_oidc_auth.repository.utils import (
     get_group,
@@ -85,7 +85,7 @@ class BaseUserPermissionRepository(Generic[ModelT, EntityT]):
         :return: The created permission entity.
         """
         _validate_permission(permission)
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             try:
                 user = get_user(session, username)
                 perm = self.model_class(
@@ -122,8 +122,10 @@ class BaseUserPermissionRepository(Generic[ModelT, EntityT]):
         :return: A list of permission entities for the user.
         """
         with self._Session() as session:
-            user = get_user(session, username)
-            rows = session.query(self.model_class).filter(self.model_class.user_id == user.id).all()
+            # Single JOIN rather than resolving the user first: this is called once per
+            # resource type when building a permission context, so the redundant user
+            # lookups added up (issue #253).
+            rows = session.query(self.model_class).join(SqlUser, SqlUser.id == self.model_class.user_id).filter(SqlUser.username == username).all()
             return [r.to_mlflow_entity() for r in rows]
 
     def list_permissions_for_resource(self, resource_id: str) -> List[EntityT]:
@@ -145,7 +147,7 @@ class BaseUserPermissionRepository(Generic[ModelT, EntityT]):
         :return: The updated permission entity.
         """
         _validate_permission(permission)
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             perm = self._get_permission(session, resource_id, username)
             perm.permission = permission
             session.flush()
@@ -157,14 +159,14 @@ class BaseUserPermissionRepository(Generic[ModelT, EntityT]):
         :param resource_id: The resource identifier value.
         :param username: The username of the user.
         """
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             perm = self._get_permission(session, resource_id, username)
             session.delete(perm)
             session.flush()
 
     def rename(self, old_name: str, new_name: str) -> None:
         """Update all permissions from old_name to new_name."""
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             perms = session.query(self.model_class).filter(getattr(self.model_class, self.resource_id_attr) == old_name).all()
             for perm in perms:
                 setattr(perm, self.resource_id_attr, new_name)
@@ -172,7 +174,7 @@ class BaseUserPermissionRepository(Generic[ModelT, EntityT]):
 
     def wipe(self, resource_id: str) -> None:
         """Delete all permissions for a resource."""
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             perms = session.query(self.model_class).filter(getattr(self.model_class, self.resource_id_attr) == resource_id).all()
             for p in perms:
                 session.delete(p)
@@ -248,12 +250,20 @@ class BaseGroupPermissionRepository(Generic[ModelT, EntityT]):
 
         :param username: The username of the user.
         :return: A list of group names the user belongs to.
+
+        Resolved in a single JOIN rather than user -> user_groups -> groups; this runs
+        on every group-scoped permission check (issue #253).
         """
         with self._Session() as session:
-            user = get_user(session, username)
-            user_groups_ids = list_user_groups(session, user)
-            user_groups = session.query(SqlGroup).filter(SqlGroup.id.in_([ug.group_id for ug in user_groups_ids])).all()
-            return [ug.group_name for ug in user_groups]
+            rows = (
+                session.query(SqlGroup.group_name)
+                .join(SqlUserGroup, SqlGroup.id == SqlUserGroup.group_id)
+                .join(SqlUser, SqlUser.id == SqlUserGroup.user_id)
+                .filter(SqlUser.username == username)
+                .order_by(SqlGroup.id)
+                .all()
+            )
+            return [r[0] for r in rows]
 
     def grant_group_permission(self, group_name: str, resource_id: str, permission: str) -> EntityT:
         """Create a new group permission for a resource.
@@ -264,7 +274,7 @@ class BaseGroupPermissionRepository(Generic[ModelT, EntityT]):
         :return: The created permission entity.
         """
         _validate_permission(permission)
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             try:
                 group = get_group(session, group_name)
                 perm = self.model_class(
@@ -330,12 +340,23 @@ class BaseGroupPermissionRepository(Generic[ModelT, EntityT]):
         :raises MlflowException: If no group permission found.
         """
         with self._Session() as session:
-            user_groups = self._list_user_groups(username)
+            # One query for every group the user belongs to, rather than a lookup per
+            # group (which was 3 + 2G statements — 19 for a user in 8 groups). This is
+            # the hottest path in the resolver: a search-filter pass runs it once per
+            # resource. See issue #253.
+            candidates = (
+                session.query(self.model_class)
+                .join(SqlUserGroup, SqlUserGroup.group_id == self.model_class.group_id)
+                .join(SqlUser, SqlUser.id == SqlUserGroup.user_id)
+                .filter(
+                    SqlUser.username == username,
+                    getattr(self.model_class, self.resource_id_attr) == resource_id,
+                )
+                .order_by(self.model_class.group_id)
+                .all()
+            )
             user_perms = None
-            for ug in user_groups:
-                perms = self._get_group_permission_or_none(session, resource_id, ug)
-                if perms is None:
-                    continue
+            for perms in candidates:
                 if user_perms is None:
                     user_perms = perms
                     continue
@@ -365,9 +386,16 @@ class BaseGroupPermissionRepository(Generic[ModelT, EntityT]):
         :return: A list of permission entities.
         """
         with self._Session() as session:
-            user = get_user(session, username=username)
-            user_groups = list_user_groups(session, user)
-            perms = session.query(self.model_class).filter(self.model_class.group_id.in_([ug.group_id for ug in user_groups])).all()
+            # Single JOIN across users -> user_groups -> permissions, rather than three
+            # round-trips resolving the user and their memberships first (issue #253).
+            perms = (
+                session.query(self.model_class)
+                .join(SqlUserGroup, SqlUserGroup.group_id == self.model_class.group_id)
+                .join(SqlUser, SqlUser.id == SqlUserGroup.user_id)
+                .filter(SqlUser.username == username)
+                .order_by(self.model_class.group_id)
+                .all()
+            )
             return [p.to_mlflow_entity() for p in perms]
 
     def update_group_permission(self, group_name: str, resource_id: str, permission: str) -> EntityT:
@@ -379,7 +407,7 @@ class BaseGroupPermissionRepository(Generic[ModelT, EntityT]):
         :return: The updated permission entity.
         """
         _validate_permission(permission)
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             group = get_group(session, group_name)
             perm = (
                 session.query(self.model_class)
@@ -399,7 +427,7 @@ class BaseGroupPermissionRepository(Generic[ModelT, EntityT]):
         :param group_name: The name of the group.
         :param resource_id: The resource identifier value.
         """
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             group = get_group(session, group_name)
             perm = (
                 session.query(self.model_class)
@@ -414,7 +442,7 @@ class BaseGroupPermissionRepository(Generic[ModelT, EntityT]):
 
     def rename(self, old_name: str, new_name: str) -> None:
         """Update all group permissions from old_name to new_name."""
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             perms = session.query(self.model_class).filter(getattr(self.model_class, self.resource_id_attr) == old_name).all()
             for perm in perms:
                 setattr(perm, self.resource_id_attr, new_name)
@@ -422,7 +450,7 @@ class BaseGroupPermissionRepository(Generic[ModelT, EntityT]):
 
     def wipe(self, resource_id: str) -> None:
         """Delete all group permissions for a resource."""
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             perms = session.query(self.model_class).filter(getattr(self.model_class, self.resource_id_attr) == resource_id).all()
             for p in perms:
                 session.delete(p)
@@ -481,7 +509,7 @@ class BaseRegexPermissionRepository(Generic[ModelT, EntityT]):
         """
         validate_regex(regex)
         _validate_permission(permission)
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             try:
                 user = get_user(session, username)
                 perm = self.model_class(
@@ -527,8 +555,15 @@ class BaseRegexPermissionRepository(Generic[ModelT, EntityT]):
         :return: A list of permission entities.
         """
         with self._Session() as session:
-            user = get_user(session, username)
-            rows = session.query(self.model_class).filter(self.model_class.user_id == user.id).order_by(self.model_class.priority).all()
+            # Single JOIN rather than resolving the user first — building a permission
+            # context calls this once per resource type (issue #253).
+            rows = (
+                session.query(self.model_class)
+                .join(SqlUser, SqlUser.id == self.model_class.user_id)
+                .filter(SqlUser.username == username)
+                .order_by(self.model_class.priority)
+                .all()
+            )
             return [r.to_mlflow_entity() for r in rows]
 
     def update(self, regex: str, priority: int, permission: str, username: str, id: int) -> EntityT:
@@ -543,7 +578,7 @@ class BaseRegexPermissionRepository(Generic[ModelT, EntityT]):
         """
         validate_regex(regex)
         _validate_permission(permission)
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             user = get_user(session, username)
             perm = self._get_regex_permission(session, user.id, id)
             perm.priority = priority
@@ -558,7 +593,7 @@ class BaseRegexPermissionRepository(Generic[ModelT, EntityT]):
         :param username: The username of the user.
         :param id: The ID of the permission record.
         """
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             user = get_user(session, username)
             perm = self._get_regex_permission(session=session, user_id=user.id, id=id)
             session.delete(perm)
@@ -627,7 +662,7 @@ class BaseGroupRegexPermissionRepository(Generic[ModelT, EntityT]):
         """
         _validate_permission(permission)
         validate_regex(regex)
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             try:
                 group = get_group(session, group_name)
                 perm = self.model_class(
@@ -669,7 +704,7 @@ class BaseGroupRegexPermissionRepository(Generic[ModelT, EntityT]):
         """
         _validate_permission(permission)
         validate_regex(regex)
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             group = get_group(session, group_name)
             perm = self._get_group_regex_permission(session, id, group.id)
             perm.permission = permission
@@ -684,7 +719,7 @@ class BaseGroupRegexPermissionRepository(Generic[ModelT, EntityT]):
         :param group_name: The name of the group.
         :param id: The ID of the permission record.
         """
-        with self._Session() as session:
+        with self._Session(read_only=False) as session:
             group = get_group(session, group_name)
             perm = self._get_group_regex_permission(session, id, group.id)
             session.delete(perm)
@@ -740,8 +775,18 @@ class BaseGroupRegexPermissionRepository(Generic[ModelT, EntityT]):
         :return: A list of permission entities.
         """
         with self._Session() as session:
-            user = get_user(session, username)
-            user_groups = list_user_groups(session, user)
-            group_ids = [group.id for group in user_groups]
+            # Resolve the user's group ids in one JOIN.
+            #
+            # NOTE: this previously read ``group.id`` off the rows returned by
+            # list_user_groups, which are SqlUserGroup (join-table) rows — so it used the
+            # membership row's PK as if it were a group id and resolved permissions for
+            # the wrong groups. It is not reachable in production today (only the
+            # non-regex BaseGroupPermissionRepository variant is called), but every
+            # regex-group repository inherits this, so the latent bug is removed here
+            # rather than left for the first caller to hit.
+            group_ids = [
+                row[0]
+                for row in session.query(SqlUserGroup.group_id).join(SqlUser, SqlUser.id == SqlUserGroup.user_id).filter(SqlUser.username == username).all()
+            ]
             permissions = self._list_group_permissions(session, group_ids)
             return [p.to_mlflow_entity() for p in permissions]

@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
+from mlflow.exceptions import MlflowException
 
 from mlflow_oidc_auth.audit import emit_audit_event
 from mlflow_oidc_auth.dependencies import check_admin_permission
@@ -33,6 +35,7 @@ users_router = APIRouter(
 
 USERS_ROOT = ""
 CREATE_ACCESS_TOKEN = "/access-token"
+USER_OWNERSHIP = "/ownership"
 CURRENT_USER = "/current"
 USERNAME = "/{username}"
 
@@ -97,6 +100,13 @@ async def create_access_token(
 
             try:
                 expiration = datetime.fromisoformat(expiration_str)
+                # An ISO 8601 timestamp carries no offset unless one is written, and both
+                # "2027-01-01" and "2027-01-01T00:00:00" are valid. Comparing a naive datetime
+                # to an aware one raises TypeError, which is not a ValueError and so used to
+                # escape as a 500. This layer deals in UTC — the 'Z' handling above says so —
+                # so read a missing offset as UTC rather than rejecting the request (issue #338).
+                if expiration.tzinfo is None:
+                    expiration = expiration.replace(tzinfo=timezone.utc)
                 now = datetime.now(timezone.utc)
 
                 if expiration < now:
@@ -107,22 +117,39 @@ async def create_access_token(
                         status_code=400,
                         detail="Expiration date must be less than 1 year in the future",
                     )
-            except ValueError:
+            except (ValueError, TypeError):
+                # TypeError is belt-and-braces: the normalization above should make it
+                # unreachable, but a bad expiration must never become a 500.
                 raise HTTPException(status_code=400, detail=f"Invalid expiration date format")
 
-        # Check if the target user exists
-        user = store.get_user_profile(target_username)
+        # Check if the target user exists. get_user_profile raises rather than returning None,
+        # so without this the outer handler turns a mistyped username into a 500 (issue #338).
+        try:
+            user = store.get_user_profile(target_username)
+        except MlflowException:
+            raise HTTPException(status_code=404, detail=f"User {target_username} not found")
         if user is None:
             raise HTTPException(status_code=404, detail=f"User {target_username} not found")
 
-        # Generate new token and update user
+        # Generate new token and update user. The new token carries exactly the expiration
+        # requested here; it never inherits the previous token's (issue #338).
+        previous_expiration = user.password_expiration
         new_token = generate_token()
-        store.update_user(username=target_username, password=new_token, password_expiration=expiration)
+        # An administrator acting through the admin API is break glass by definition: they must
+        # be able to repair a row a directory owns, and the attempt is audited either way (#319).
+        store.update_user(username=target_username, password=new_token, password_expiration=expiration, written_by="manual", admin_override=True)
         emit_audit_event(
             "user.token_rotate",
             actor=current_username,
             resource_type="user",
             resource_id=target_username,
+            detail={
+                "expiration": expiration.isoformat() if expiration else None,
+                # Rotating without an expiration replaces an expiring token with one that does
+                # not expire. That is a deliberate widening of the credential's lifetime, so it
+                # is recorded rather than left silent.
+                "expiration_cleared": previous_expiration is not None and expiration is None,
+            },
         )
 
         return JSONResponse(
@@ -250,6 +277,59 @@ async def create_new_user(
     except Exception as e:
         logger.error(f"Error creating user: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create user")
+
+
+@users_router.patch(
+    USER_OWNERSHIP,
+    summary="Change which source owns a user",
+    description="Sets a user's managed_by. Admins only. This is the break-glass path when a directory is decommissioned.",
+)
+async def set_user_ownership(
+    username: str = Body(..., description="The user whose ownership is being changed"),
+    managed_by: str = Body(..., description="The new owner: 'manual', 'scim', or 'oidc:<provider-id>'"),
+    admin_username: str = Depends(check_admin_permission),
+) -> JSONResponse:
+    """Hand a user row to a different source (issue #319).
+
+    The guard's whole failure mode is lockout, and lockout is only survivable if an
+    administrator can undo it *without* database access. That is what this is: an explicit,
+    audited administrator write, permitted in every enforcement mode.
+
+    The common case is a directory being decommissioned — its rows are set back to ``manual``
+    and become editable again. ``mlflow-oidc db reconcile-ownership`` does the same thing in
+    bulk, for an operator who does have a shell.
+
+    Parameters:
+        username: The user whose ownership is being changed.
+        managed_by: The new owner.
+        admin_username: The authenticated administrator (injected).
+
+    Returns:
+        JSONResponse: What changed.
+
+    Raises:
+        HTTPException: 400 if the owner is not one a source presents, 404 if there is no such
+            user.
+    """
+    if not re.fullmatch(r"manual|scim|oidc:[A-Za-z0-9._-]+", managed_by or ""):
+        raise HTTPException(status_code=400, detail="managed_by must be 'manual', 'scim', or 'oidc:<provider-id>'")
+
+    try:
+        store.get_user_profile(username)
+    except MlflowException:
+        raise HTTPException(status_code=404, detail=f"User {username} not found")
+
+    previous = store.get_user_profile(username).managed_by
+    store.update_user(username=username, managed_by=managed_by, written_by="manual", admin_override=True)
+    emit_audit_event(
+        "user.ownership_set",
+        actor=admin_username,
+        resource_type="user",
+        resource_id=username,
+        detail={"from": previous, "to": managed_by},
+    )
+    logger.info("Administrator %s set ownership of %s from %s to %s", admin_username, username, previous, managed_by)
+    return JSONResponse(content={"username": username, "managed_by": managed_by, "previous": previous}, status_code=200)
 
 
 @users_router.delete(

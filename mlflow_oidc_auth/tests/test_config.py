@@ -102,6 +102,11 @@ class TestAppConfig(unittest.TestCase):
             "PERMISSION_SOURCE_ORDER",
             "EXTEND_MLFLOW_MENU",
             "DEFAULT_LANDING_PAGE_IS_PERMISSIONS",
+            "SESSION_COOKIE_NAME",
+            "SESSION_COOKIE_MAX_AGE_SECONDS",
+            "SESSION_COOKIE_SAMESITE",
+            "SESSION_COOKIE_SECURE",
+            "ENABLE_API_DOCS",
         ]
 
         for var in env_vars_to_clear:
@@ -111,7 +116,10 @@ class TestAppConfig(unittest.TestCase):
         config = AppConfig()
 
         # Test default values
-        self.assertEqual(config.DEFAULT_MLFLOW_PERMISSION, "MANAGE")
+        # Deny by default (#293): a resource with no user, group, regex or group-regex
+        # grant is not reachable. This shipped as MANAGE, which made a fresh install
+        # open by default. Setting it to MANAGE explicitly is still supported.
+        self.assertEqual(config.DEFAULT_MLFLOW_PERMISSION, "NO_PERMISSIONS")
         self.assertIsNotNone(config.SECRET_KEY)
         self.assertEqual(len(config.SECRET_KEY), 32)  # secrets.token_hex(16) produces 32 chars
         self.assertEqual(config.OIDC_USERS_DB_URI, "sqlite:///auth.db")
@@ -120,7 +128,7 @@ class TestAppConfig(unittest.TestCase):
         self.assertEqual(config.OIDC_PROVIDER_DISPLAY_NAME, "Login with OIDC")
         self.assertIsNone(config.OIDC_DISCOVERY_URL)
         self.assertEqual(config.OIDC_GROUPS_ATTRIBUTE, "groups")
-        self.assertEqual(config.OIDC_SCOPE, "openid,email,profile")
+        self.assertEqual(config.OIDC_SCOPE, "openid email profile")
         self.assertIsNone(config.OIDC_GROUP_DETECTION_PLUGIN)
         self.assertIsNone(config.OIDC_REDIRECT_URI)
         self.assertIsNone(config.OIDC_CLIENT_ID)
@@ -130,6 +138,7 @@ class TestAppConfig(unittest.TestCase):
         self.assertEqual(config.PERMISSION_SOURCE_ORDER, ["user", "group", "regex", "group-regex"])
         self.assertTrue(config.EXTEND_MLFLOW_MENU)
         self.assertTrue(config.DEFAULT_LANDING_PAGE_IS_PERMISSIONS)
+        self.assertFalse(config.ENABLE_API_DOCS)
 
     def test_app_config_environment_variable_override(self):
         """Test that environment variables override default values."""
@@ -152,6 +161,7 @@ class TestAppConfig(unittest.TestCase):
             "PERMISSION_SOURCE_ORDER": "group,user,regex",
             "EXTEND_MLFLOW_MENU": "false",
             "DEFAULT_LANDING_PAGE_IS_PERMISSIONS": "false",
+            "ENABLE_API_DOCS": "false",
         }
 
         with patch.dict(os.environ, test_env):
@@ -178,6 +188,7 @@ class TestAppConfig(unittest.TestCase):
             self.assertEqual(config.PERMISSION_SOURCE_ORDER, ["group", "user", "regex"])
             self.assertFalse(config.EXTEND_MLFLOW_MENU)
             self.assertFalse(config.DEFAULT_LANDING_PAGE_IS_PERMISSIONS)
+            self.assertFalse(config.ENABLE_API_DOCS)
 
     def test_app_config_group_name_parsing(self):
         """Test that OIDC_GROUP_NAME is correctly parsed from comma-separated values."""
@@ -303,8 +314,11 @@ class TestAppConfig(unittest.TestCase):
 
     def test_workspace_feature_flags_defaults(self):
         """Test that workspace feature flags have correct default values."""
-        config = AppConfig()
-        self.assertFalse(config.MLFLOW_ENABLE_WORKSPACES)
+        with patch.dict(os.environ, {}, clear=True):
+            config = AppConfig()
+            self.assertFalse(config.MLFLOW_ENABLE_WORKSPACES)
+            self.assertFalse(config.OIDC_WORKSPACE_REQUIRE_CREATION_CONTEXT)
+            self.assertFalse(config.OIDC_WORKSPACE_DENY_DEFAULT_CREATION)
 
     def test_workspace_feature_flags_override(self):
         """Test that workspace feature flags can be overridden via environment variables."""
@@ -312,10 +326,14 @@ class TestAppConfig(unittest.TestCase):
             os.environ,
             {
                 "MLFLOW_ENABLE_WORKSPACES": "true",
+                "OIDC_WORKSPACE_REQUIRE_CREATION_CONTEXT": "true",
+                "OIDC_WORKSPACE_DENY_DEFAULT_CREATION": "true",
             },
         ):
             config = AppConfig()
             self.assertTrue(config.MLFLOW_ENABLE_WORKSPACES)
+            self.assertTrue(config.OIDC_WORKSPACE_REQUIRE_CREATION_CONTEXT)
+            self.assertTrue(config.OIDC_WORKSPACE_DENY_DEFAULT_CREATION)
 
     def test_workspace_feature_flags_disabled_by_default(self):
         """Test that workspaces are disabled by default."""
@@ -333,9 +351,13 @@ class TestAppConfig(unittest.TestCase):
 
         with patch("mlflow_oidc_auth.config.logger") as mock_logger:
             config = AppConfig()
-            mock_logger.warning.assert_called_once()
-            warning_msg = mock_logger.warning.call_args[0][0]
-            self.assertIn("SECRET_KEY is not configured", warning_msg)
+            # Assert on THIS warning, not on the total count. AppConfig emits other
+            # startup warnings (an inert RESTRICT_RESOURCE_CREATION, a permissive
+            # DEFAULT_MLFLOW_PERMISSION), and whether they fire depends on the ambient
+            # environment — a local .env can silence them while CI, which has none,
+            # sees them. Counting warnings made this test pass locally and fail in CI.
+            secret_key_warnings = [call.args[0] for call in mock_logger.warning.call_args_list if "SECRET_KEY is not configured" in call.args[0]]
+            self.assertEqual(len(secret_key_warnings), 1)
             # Should still generate a usable key
             self.assertEqual(len(config.SECRET_KEY), 32)
 
@@ -344,8 +366,46 @@ class TestAppConfig(unittest.TestCase):
         with patch.dict(os.environ, {"SECRET_KEY": "my-production-secret"}):
             with patch("mlflow_oidc_auth.config.logger") as mock_logger:
                 config = AppConfig()
-                mock_logger.warning.assert_not_called()
+                secret_key_warnings = [call.args[0] for call in mock_logger.warning.call_args_list if "SECRET_KEY" in call.args[0]]
+                self.assertEqual(secret_key_warnings, [], "a configured SECRET_KEY must not warn about SECRET_KEY")
                 self.assertEqual(config.SECRET_KEY, "my-production-secret")
+
+    def test_session_cookie_defaults(self):
+        """Test that session cookie settings have correct default values."""
+        config = AppConfig()
+        self.assertEqual(config.SESSION_COOKIE_NAME, "session")
+        self.assertEqual(config.SESSION_COOKIE_MAX_AGE_SECONDS, 14 * 24 * 60 * 60)
+        self.assertEqual(config.SESSION_COOKIE_SAMESITE, "lax")
+        self.assertFalse(config.SESSION_COOKIE_SECURE)
+
+    def test_session_cookie_env_overrides(self):
+        """SESSION_COOKIE_* env vars are picked up correctly."""
+        with patch.dict(
+            os.environ,
+            {
+                "SESSION_COOKIE_NAME": "mlflow_auth",
+                "SESSION_COOKIE_MAX_AGE_SECONDS": "3600",
+                "SESSION_COOKIE_SAMESITE": "strict",
+                "SESSION_COOKIE_SECURE": "true",
+            },
+        ):
+            config = AppConfig()
+            self.assertEqual(config.SESSION_COOKIE_NAME, "mlflow_auth")
+            self.assertEqual(config.SESSION_COOKIE_MAX_AGE_SECONDS, 3600)
+            self.assertEqual(config.SESSION_COOKIE_SAMESITE, "strict")
+            self.assertTrue(config.SESSION_COOKIE_SECURE)
+
+    def test_session_cookie_samesite_invalid_raises(self):
+        """An invalid SESSION_COOKIE_SAMESITE value raises ValueError."""
+        with patch.dict(os.environ, {"SESSION_COOKIE_SAMESITE": "invalid"}):
+            with self.assertRaises(ValueError):
+                AppConfig()
+
+    def test_session_cookie_max_age_zero_becomes_none(self):
+        """SESSION_COOKIE_MAX_AGE_SECONDS=0 is treated as no expiry (None)."""
+        with patch.dict(os.environ, {"SESSION_COOKIE_MAX_AGE_SECONDS": "0"}):
+            config = AppConfig()
+            self.assertIsNone(config.SESSION_COOKIE_MAX_AGE_SECONDS)
 
 
 if __name__ == "__main__":

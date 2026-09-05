@@ -8,7 +8,7 @@ to the default MLflow server when OIDC authentication is required.
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from mlflow.server import app
 from mlflow.version import VERSION
 from starlette.middleware.sessions import (
@@ -27,13 +27,18 @@ from mlflow_oidc_auth.middleware import (
     WorkspaceContextMiddleware,
     add_fastapi_permission_middleware,
 )
-from mlflow_oidc_auth.oauth import ensure_oidc_client_registered
-from mlflow_oidc_auth.routers import get_all_routers
+from mlflow_oidc_auth.oauth import ensure_all_clients_registered
+from mlflow_oidc_auth.routers import ajax_alias_router, get_all_routers
 
 logger = get_logger()
 
 # Global flag to track OIDC initialization status for health checks
 _oidc_initialized: bool = False
+# Per-provider registration outcome from startup. ``_oidc_initialized`` answers the readiness
+# question — can this process serve a login at all — which stays True when one of several
+# providers failed, because failing the startup probe would pull the pod from service while it
+# can still authenticate everyone else. This dict is what says *which* ones are broken (#315).
+_oidc_provider_status: dict[str, bool] = {}
 
 
 def is_oidc_ready() -> bool:
@@ -45,6 +50,15 @@ def is_oidc_ready() -> bool:
     return _oidc_initialized
 
 
+def get_oidc_provider_status() -> dict[str, bool]:
+    """Per-provider registration outcome from startup.
+
+    ``is_oidc_ready()`` alone cannot express a partial failure, and with several providers a
+    partial failure is an expected state rather than an exceptional one.
+    """
+    return dict(_oidc_provider_status)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan context manager for startup/shutdown events.
@@ -53,16 +67,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     This is critical for multi-replica deployments where any replica may receive
     /callback or /logout requests that require the OIDC client to be registered.
     """
-    global _oidc_initialized
+    global _oidc_initialized, _oidc_provider_status
 
     # Startup: Register OIDC client
     logger.info("Starting MLflow OIDC Auth Plugin...")
-    if ensure_oidc_client_registered():
+    # Every provider is registered independently, so one that is misconfigured or whose
+    # discovery document is unreachable does not disable login for the others (#315).
+    results = ensure_all_clients_registered()
+    _oidc_provider_status = results
+    registered = [provider_id for provider_id, ok in results.items() if ok]
+    failed = [provider_id for provider_id, ok in results.items() if not ok]
+
+    if registered:
         _oidc_initialized = True
-        logger.info("OIDC client successfully registered at startup")
-    else:
+        logger.info("OIDC client(s) successfully registered at startup: %s", ", ".join(sorted(registered)))
+    if failed:
         logger.warning(
-            "OIDC client registration failed at startup. "
+            "OIDC client registration failed at startup for: %s. "
+            "This may indicate missing configuration (OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_DISCOVERY_URL, "
+            "or OIDC_CLIENT_SECRET_<PROVIDER_ID> for an additional provider). "
+            "Those providers will not be available until configuration is corrected.",
+            ", ".join(sorted(failed)),
+        )
+    if not results:
+        logger.warning(
+            "No OIDC client was registered at startup. "
             "This may indicate missing configuration (OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_DISCOVERY_URL). "
             "OIDC authentication will not be available until configuration is corrected."
         )
@@ -101,6 +130,19 @@ def _seed_default_workspace() -> None:
             logger.info(f"Default workspace '{DEFAULT_WORKSPACE}' created")
     except Exception as e:
         logger.warning(f"Could not seed default workspace: {e}")
+
+
+def _include_router(oidc_app: FastAPI, router: APIRouter) -> None:
+    """Register a router, plus the "/ajax-api" twins of its "/api" routes.
+
+    MLflow's web UI calls "/ajax-api/..." while API clients call "/api/...".
+    Registering both keeps UI-facing endpoints reachable; see
+    `mlflow_oidc_auth.routers.ajax_alias_router`.
+    """
+    oidc_app.include_router(router)
+    alias = ajax_alias_router(router)
+    if alias.routes:
+        oidc_app.include_router(alias)
 
 
 def _include_mlflow_fastapi_routers(oidc_app: FastAPI) -> None:
@@ -151,7 +193,7 @@ def _include_mlflow_fastapi_routers(oidc_app: FastAPI) -> None:
         logger.debug("mlflow.server.assistant.api not available — Assistant endpoints disabled")
 
 
-def create_app() -> Any:
+def create_app() -> FastAPI:
     """Create a FastAPI application with OIDC integration.
 
     The app uses a lifespan context manager to ensure OIDC client registration
@@ -161,9 +203,9 @@ def create_app() -> Any:
         title="MLflow Tracking Server with OIDC Auth",
         description="MLflow Tracking Server API with OIDC Authentication",
         version=VERSION,
-        docs_url="/docs" if getattr(config, "ENABLE_API_DOCS", True) else None,
-        redoc_url="/redoc" if getattr(config, "ENABLE_API_DOCS", True) else None,
-        openapi_url="/openapi.json" if getattr(config, "ENABLE_API_DOCS", True) else None,
+        docs_url="/docs" if config.ENABLE_API_DOCS else None,
+        redoc_url="/redoc" if config.ENABLE_API_DOCS else None,
+        openapi_url="/openapi.json" if config.ENABLE_API_DOCS else None,
         lifespan=lifespan,
     )
     register_exception_handlers(oidc_app)
@@ -181,13 +223,22 @@ def create_app() -> Any:
     oidc_app.add_middleware(ProxyHeadersMiddleware)
     oidc_app.add_middleware(AuthMiddleware)
     oidc_app.add_middleware(WorkspaceContextMiddleware)
-    oidc_app.add_middleware(StarletteSessionMiddleware, secret_key=config.SECRET_KEY)
+    oidc_app.add_middleware(
+        StarletteSessionMiddleware,
+        secret_key=config.SECRET_KEY,
+        session_cookie=config.SESSION_COOKIE_NAME,
+        max_age=config.SESSION_COOKIE_MAX_AGE_SECONDS,
+        same_site=config.SESSION_COOKIE_SAMESITE,
+        https_only=config.SESSION_COOKIE_SECURE,
+    )
 
     for router in get_all_routers():
-        oidc_app.include_router(router)
+        _include_router(oidc_app, router)
 
-    # Add links to MLFlow UI
-    if config.EXTEND_MLFLOW_MENU:
+    # Inject into MLflow's index.html when the menu links or the re-auth helper
+    # are enabled. Both live in the same hack module to keep injection ordering
+    # predictable.
+    if config.EXTEND_MLFLOW_MENU or config.EXTEND_MLFLOW_REAUTH:
         from mlflow_oidc_auth import hack
 
         app.view_functions["serve"] = hack.index
@@ -210,8 +261,8 @@ def create_app() -> Any:
             workspace_regex_permissions_router,
         )
 
-        oidc_app.include_router(workspace_permissions_router)
-        oidc_app.include_router(workspace_regex_permissions_router)
+        _include_router(oidc_app, workspace_permissions_router)
+        _include_router(oidc_app, workspace_regex_permissions_router)
 
     # ---------------------------------------------------------------------------
     # Include MLflow's FastAPI-native routers (GAP-ARCH-01 fix)
