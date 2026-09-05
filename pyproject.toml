@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mlflow-oidc-auth"
 dynamic = ["version"]
-description = "OIDC auth plugin for MLflow"
+description = "OpenID Connect (OIDC) auth plugin for MLflow"
 readme = "README.md"
 keywords = ["mlflow", "oauth2", "oidc"]
 license = "Apache-2.0"
@@ -20,40 +20,64 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Topic :: Software Development :: Libraries :: Python Modules",
   "Operating System :: OS Independent",
-  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.10",
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
-  "cachelib<1",
-  "mlflow-skinny<4,>=3.6.0",
+  "mlflow<4,>=3.14.0",
   "python-dotenv<2",
-  "requests<3,>=2.31.0",
-  "sqlalchemy<3,>=1.4.0",
+  "requests<3,>=2.32.5",
+  "sqlalchemy<3,>=2.0.46",
   "flask<4",
-  "flask-session>=0.7.0",
   "gunicorn<24; platform_system != 'Windows'",
-  "alembic<2,!=1.10.0",
+  "alembic<2,!=1.18.4",
   "authlib<2",
-  "flask-caching<3"
+  "uvicorn>=0.41.0",
+  "fastapi>=0.132.0",
+  "asgiref>=3.11.1",
+  "httpx>=0.28.1",
+  "cachetools>=5.5.0"
 ]
 
 [project.optional-dependencies]
-full = ["mlflow<4,>=3.6.0"]
-fastapi = ["fastapi>=0.100.0", "uvicorn>=0.20.0"]
-caching-redis = ["redis[hiredis]<6"]
 dev = [
   "black<26,>=24.8.0",
   "pytest<9,>=8.3.2",
   "pre-commit<5",
+  "autoflake<2"
 ]
 test = [
   "pytest<9,>=8.3.2",
   "pytest-cov<6,>=5.0.0",
+  "pytest-asyncio<2",
+  "httpx<1,>=0.28.1",
+]
+# Cloud provider optional dependencies for pluggable config
+aws = [
+  "boto3>=1.42.26",
+]
+azure = [
+  "azure-identity>=1.25.1",
+  "azure-keyvault-secrets>=4.10.0",
+]
+vault = [
+  "hvac>=2.4.0",
+]
+# All cloud providers combined
+cloud = [
+  "boto3>=1.42.26",
+  "azure-identity>=1.25.1",
+  "azure-keyvault-secrets>=4.10.0",
+  "hvac>=2.4.0",
+]
+# Redis cache backend
+cache = [
+  "redis>=5.0.0,<6",
 ]
 
 [[project.maintainers]]
 name = "Alexander Kharkevich"
-email = "alexander_kharkevich@outlook.com"
+email = "alex@kharkevich.org"
 
 [project.urls]
 homepage = "https://github.com/mlflow-oidc/mlflow-oidc-auth"
@@ -61,21 +85,18 @@ issues = "https://github.com/mlflow-oidc/mlflow-oidc-auth/issues"
 documentation = "https://github.com/mlflow-oidc/mlflow-oidc-auth/tree/main/docs/"
 repository = "https://github.com/mlflow-oidc/mlflow-oidc-auth"
 
-[project.entry-points."mlflow.app"]
-oidc-auth = "mlflow_oidc_auth.fastapi_app:app"
-oidc-auth-flask = "mlflow_oidc_auth.app:app"
-oidc-auth-fastapi = "mlflow_oidc_auth.fastapi_app:app"
+[project.scripts]
+mlflow-oidc-server = "mlflow_oidc_auth.cli:run"
 
-[project.entry-points."mlflow_oidc_auth.client"]
-basic-auth = "mlflow_oidc_auth.client:AuthServiceClient"
+[project.entry-points."mlflow.app"]
+oidc-auth = "mlflow_oidc_auth.app:app"
 
 [tool.setuptools.package-data]
 mlflow_oidc_auth = [
   "db/migrations/alembic.ini",
   "hack/menu.html",
-  "static/*",
-  "templates/*",
-  "ui/*",
+  "hack/reauth.html",
+  "ui/**/*",
 ]
 
 [tool.setuptools.packages.find]
@@ -88,3 +109,17 @@ version = {attr = "mlflow_oidc_auth.version"}
 
 [tool.black]
 line-length = 160
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["mlflow_oidc_auth/tests"]
+markers = [
+  "integration: end-to-end tests that require a running server",
+]
+norecursedirs = [
+  "mlruns",
+  "mlruns.old",
+  "htmlcov",
+  "__pycache__",
+  "integration",
+]

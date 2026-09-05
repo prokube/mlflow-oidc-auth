@@ -1,29 +1,26 @@
 """
 Data fetching utilities for MLflow resources.
 
-This module provides functions to fetch experiments, registered models, and logged models
-from MLflow stores with proper pagination and permission filtering. All functions handle
-pagination automatically to ensure complete data retrieval.
+This module provides functions to fetch experiments, registered models, logged models,
+and gateway endpoints from MLflow stores with proper pagination and permission filtering.
+All functions handle pagination automatically to ensure complete data retrieval.
 
 Key Features:
 - Automatic pagination handling for large datasets
 - Permission-based filtering for security
 - Support for both complete and paginated data retrieval
 - Efficient memory usage through streaming pagination
+- Gateway endpoint fetching from MLflow's unified gateway
 """
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from mlflow.entities import Experiment
 from mlflow.entities.model_registry import RegisteredModel
 from mlflow.server.handlers import _get_model_registry_store, _get_tracking_store
 from mlflow.store.entities.paged_list import PagedList
 
-from mlflow_oidc_auth.config import config
-from mlflow_oidc_auth.permissions import get_permission
-from mlflow_oidc_auth.store import store
-from mlflow_oidc_auth.utils.permissions import can_read_experiment, can_read_registered_model
-from mlflow_oidc_auth.utils.request_helpers import get_username
+from mlflow_oidc_auth.utils.permissions import can_read_experiment, can_read_registered_model, effective_experiment_permission
 
 
 def fetch_all_registered_models(
@@ -167,11 +164,11 @@ def fetch_experiments_paginated(
 
 
 def fetch_readable_experiments(
+    username: str,
     view_type: int = 1,
     max_results_per_page: int = 1000,
     order_by: Optional[List[str]] = None,
     filter_string: Optional[str] = None,
-    username: Optional[str] = None,  # ACTIVE_ONLY
 ) -> List[Experiment]:
     """
     Fetch ALL experiments that the user can read from the MLflow tracking store using pagination.
@@ -187,9 +184,6 @@ def fetch_readable_experiments(
     Returns:
         List of Experiment objects that the user can read
     """
-    if username is None:
-        username = get_username()
-
     # Get all experiments matching the filter
     all_experiments = fetch_all_experiments(view_type=view_type, max_results_per_page=max_results_per_page, order_by=order_by, filter_string=filter_string)
 
@@ -200,7 +194,10 @@ def fetch_readable_experiments(
 
 
 def fetch_readable_registered_models(
-    filter_string: Optional[str] = None, order_by: Optional[List[str]] = None, max_results_per_page: int = 1000, username: Optional[str] = None
+    username: str,
+    filter_string: Optional[str] = None,
+    order_by: Optional[List[str]] = None,
+    max_results_per_page: int = 1000,
 ) -> List[RegisteredModel]:
     """
     Fetch ALL registered models that the user can read from the MLflow model registry using pagination.
@@ -215,8 +212,6 @@ def fetch_readable_registered_models(
     Returns:
         List of RegisteredModel objects that the user can read
     """
-    if username is None:
-        username = get_username()
 
     # Get all models matching the filter
     all_models = fetch_all_registered_models(filter_string=filter_string, order_by=order_by, max_results_per_page=max_results_per_page)
@@ -228,11 +223,11 @@ def fetch_readable_registered_models(
 
 
 def fetch_readable_logged_models(
+    username: str,
     experiment_ids: Optional[List[str]] = None,
     filter_string: Optional[str] = None,
     order_by: Optional[List[dict]] = None,
     max_results_per_page: int = 1000,
-    username: Optional[str] = None,
 ) -> List:
     """
     Fetch ALL logged models that the user can read from the MLflow tracking store using pagination.
@@ -248,14 +243,6 @@ def fetch_readable_logged_models(
     Returns:
         List of LoggedModel objects that the user can read
     """
-
-    if username is None:
-        username = get_username()
-
-    # Get user permissions
-    perms = store.list_experiment_permissions(username)
-    can_read_perms = {p.experiment_id: get_permission(p.permission).can_read for p in perms}
-    default_can_read = get_permission(config.DEFAULT_MLFLOW_PERMISSION).can_read
 
     all_models = []
     page_token = None
@@ -273,7 +260,7 @@ def fetch_readable_logged_models(
 
         # Filter models based on read permissions
         for model in result:
-            if can_read_perms.get(model.experiment_id, default_can_read):
+            if effective_experiment_permission(model.experiment_id, username).permission.can_read:
                 all_models.append(model)
 
         # Check if there are more pages
@@ -281,5 +268,77 @@ def fetch_readable_logged_models(
             page_token = result.token
         else:
             break
+
+    return all_models
+
+
+def fetch_all_gateway_endpoints() -> List[Dict[str, Any]]:
+    """
+    Fetch ALL gateway endpoints from the MLflow tracking store.
+
+    This function retrieves gateway endpoints from MLflow's unified gateway store,
+    which stores endpoint configurations for the AI Gateway.
+
+    Returns:
+        List of gateway endpoint dictionaries containing endpoint metadata.
+        Each dictionary includes fields like 'endpoint_id', 'name', 'model_mappings', etc.
+    """
+    all_endpoints: List[Dict[str, Any]] = []
+
+    result = _get_tracking_store().list_gateway_endpoints()
+
+    # Convert endpoint objects to dictionaries if needed
+    for endpoint in result:
+        if hasattr(endpoint, "to_dict"):
+            all_endpoints.append(endpoint.to_dict())
+        elif hasattr(endpoint, "__dict__"):
+            all_endpoints.append(vars(endpoint))
+        else:
+            all_endpoints.append(endpoint)
+
+    return all_endpoints
+
+
+def fetch_all_gateway_secrets() -> List[Dict[str, Any]]:
+    """
+    Fetch ALL gateway secrets from the MLflow tracking store.
+
+    Returns:
+        List of gateway secret dictionaries.
+    """
+    all_secrets: List[Dict[str, Any]] = []
+
+    # MLflow uses list_secret_infos for gateway secrets
+    result = _get_tracking_store().list_secret_infos()
+
+    for secret in result:
+        if hasattr(secret, "to_dict"):
+            all_secrets.append(secret.to_dict())
+        elif hasattr(secret, "__dict__"):
+            all_secrets.append(vars(secret))
+        else:
+            all_secrets.append(secret)
+
+    return all_secrets
+
+
+def fetch_all_gateway_model_definitions() -> List[Dict[str, Any]]:
+    """
+    Fetch ALL gateway model definitions from the MLflow tracking store.
+
+    Returns:
+        List of gateway model definition dictionaries.
+    """
+    all_models: List[Dict[str, Any]] = []
+
+    result = _get_tracking_store().list_gateway_model_definitions()
+
+    for model in result:
+        if hasattr(model, "to_dict"):
+            all_models.append(model.to_dict())
+        elif hasattr(model, "__dict__"):
+            all_models.append(vars(model))
+        else:
+            all_models.append(model)
 
     return all_models

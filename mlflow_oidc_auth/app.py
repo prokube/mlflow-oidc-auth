@@ -1,196 +1,291 @@
-import os
+"""
+FastAPI application factory for MLflow OIDC Auth Plugin.
 
-from flask_caching import Cache
-from flask_session import Session
+This module provides a FastAPI application factory that can be used as an alternative
+to the default MLflow server when OIDC authentication is required.
+"""
+
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
+
+from fastapi import APIRouter, FastAPI
 from mlflow.server import app
-from werkzeug.middleware.proxy_fix import ProxyFix
+from mlflow.version import VERSION
+from starlette.middleware.sessions import (
+    SessionMiddleware as StarletteSessionMiddleware,
+)
 
-from mlflow_oidc_auth import routes, views
 from mlflow_oidc_auth.config import config
+from mlflow_oidc_auth.exceptions import register_exception_handlers
+from mlflow_oidc_auth.graphql import install_mlflow_graphql_authorization_middleware
 from mlflow_oidc_auth.hooks import after_request_hook, before_request_hook
 from mlflow_oidc_auth.logger import get_logger
+from mlflow_oidc_auth.middleware import (
+    AuthAwareWSGIMiddleware,
+    AuthMiddleware,
+    ProxyHeadersMiddleware,
+    WorkspaceContextMiddleware,
+    add_fastapi_permission_middleware,
+)
+from mlflow_oidc_auth.oauth import ensure_all_clients_registered
+from mlflow_oidc_auth.routers import ajax_alias_router, get_all_routers
 
 logger = get_logger()
 
-# Configure custom Flask app
-template_dir = os.path.dirname(__file__)
-template_dir = os.path.join(template_dir, "templates")
-
-app.config.from_object(config)
-app.secret_key = app.config["SECRET_KEY"].encode("utf8")
-app.template_folder = template_dir
-static_folder = app.static_folder
-
-# Configure ProxyFix middleware to handle reverse proxy headers
-app.wsgi_app = ProxyFix(
-    app.wsgi_app,
-    x_for=config.PROXY_FIX_X_FOR,
-    x_proto=config.PROXY_FIX_X_PROTO,
-    x_host=config.PROXY_FIX_X_HOST,
-    x_port=config.PROXY_FIX_X_PORT,
-    x_prefix=config.PROXY_FIX_X_PREFIX,
-)
-
-logger.debug(
-    f"ProxyFix middleware configured - x_for={config.PROXY_FIX_X_FOR}, x_proto={config.PROXY_FIX_X_PROTO}, x_host={config.PROXY_FIX_X_HOST}, x_port={config.PROXY_FIX_X_PORT}, x_prefix={config.PROXY_FIX_X_PREFIX}"
-)
-
-# Add links to MLFlow UI
-if config.EXTEND_MLFLOW_MENU:
-    app.view_functions["serve"] = views.index
-
-# OIDC routes
-app.add_url_rule(rule=routes.LOGIN, methods=["GET"], view_func=views.login)
-app.add_url_rule(rule=routes.LOGOUT, methods=["GET"], view_func=views.logout)
-app.add_url_rule(rule=routes.CALLBACK, methods=["GET"], view_func=views.callback)
-
-# UI routes
-app.add_url_rule(rule=routes.STATIC, methods=["GET"], view_func=views.oidc_static)
-app.add_url_rule(rule=routes.UI, methods=["GET"], view_func=views.oidc_ui)
-app.add_url_rule(rule=routes.UI_ROOT, methods=["GET"], view_func=views.oidc_ui)
-
-# Runtime configuration endpoint under UI path
-app.add_url_rule(rule=routes.UI_CONFIG, methods=["GET"], view_func=views.get_runtime_config)
-
-# User token
-app.add_url_rule(rule=routes.CREATE_ACCESS_TOKEN, methods=["PATCH"], view_func=views.create_user_access_token)
-app.add_url_rule(rule=routes.GET_CURRENT_USER, methods=["GET"], view_func=views.get_current_user)
-
-# User management
-app.add_url_rule(rule=routes.CREATE_USER, methods=["POST"], view_func=views.create_new_user)
-app.add_url_rule(rule=routes.GET_USER, methods=["GET"], view_func=views.get_user)
-app.add_url_rule(rule=routes.UPDATE_USER_PASSWORD, methods=["PATCH"], view_func=views.update_username_password)
-app.add_url_rule(rule=routes.UPDATE_USER_ADMIN, methods=["PATCH"], view_func=views.update_user_admin)
-app.add_url_rule(rule=routes.DELETE_USER, methods=["DELETE"], view_func=views.delete_user)
+# Global flag to track OIDC initialization status for health checks
+_oidc_initialized: bool = False
+# Per-provider registration outcome from startup. ``_oidc_initialized`` answers the readiness
+# question — can this process serve a login at all — which stays True when one of several
+# providers failed, because failing the startup probe would pull the pod from service while it
+# can still authenticate everyone else. This dict is what says *which* ones are broken (#315).
+_oidc_provider_status: dict[str, bool] = {}
 
 
-# UI routes support
-app.add_url_rule(rule=routes.EXPERIMENT_USER_PERMISSIONS, methods=["GET"], view_func=views.get_experiment_users)
-app.add_url_rule(rule=routes.PROMPT_USER_PERMISSIONS, methods=["GET"], view_func=views.get_prompt_users)
-app.add_url_rule(rule=routes.REGISTERED_MODEL_USER_PERMISSIONS, methods=["GET"], view_func=views.get_registered_model_users)
+def is_oidc_ready() -> bool:
+    """Check if OIDC client has been initialized at startup.
 
-# List resources
-app.add_url_rule(rule=routes.LIST_EXPERIMENTS, methods=["GET"], view_func=views.list_experiments)
-app.add_url_rule(rule=routes.LIST_MODELS, methods=["GET"], view_func=views.list_registered_models)
-app.add_url_rule(rule=routes.LIST_PROMPTS, methods=["GET"], view_func=views.list_prompts)
-app.add_url_rule(rule=routes.LIST_USERS, methods=["GET"], view_func=views.list_users)
-app.add_url_rule(rule=routes.LIST_GROUPS, methods=["GET"], view_func=views.list_groups)
-
-# user experiment permission management
-app.add_url_rule(rule=routes.USER_EXPERIMENT_PERMISSIONS, methods=["GET"], view_func=views.list_user_experiments)
-app.add_url_rule(rule=routes.USER_EXPERIMENT_PERMISSION_DETAIL, methods=["POST"], view_func=views.create_experiment_permission)
-app.add_url_rule(rule=routes.USER_EXPERIMENT_PERMISSION_DETAIL, methods=["GET"], view_func=views.get_experiment_permission)
-app.add_url_rule(rule=routes.USER_EXPERIMENT_PERMISSION_DETAIL, methods=["PATCH"], view_func=views.update_experiment_permission)
-app.add_url_rule(rule=routes.USER_EXPERIMENT_PERMISSION_DETAIL, methods=["DELETE"], view_func=views.delete_experiment_permission)
-
-# user experiment regex permission management
-app.add_url_rule(rule=routes.USER_EXPERIMENT_PATTERN_PERMISSIONS, methods=["POST"], view_func=views.create_experiment_regex_permission)
-app.add_url_rule(rule=routes.USER_EXPERIMENT_PATTERN_PERMISSIONS, methods=["GET"], view_func=views.list_user_experiment_regex_permission)
-app.add_url_rule(rule=routes.USER_EXPERIMENT_PATTERN_PERMISSION_DETAIL, methods=["GET"], view_func=views.get_experiment_regex_permission)
-app.add_url_rule(rule=routes.USER_EXPERIMENT_PATTERN_PERMISSION_DETAIL, methods=["PATCH"], view_func=views.update_experiment_regex_permission)
-app.add_url_rule(
-    rule=routes.USER_EXPERIMENT_PATTERN_PERMISSION_DETAIL,
-    methods=["DELETE"],
-    view_func=views.delete_experiment_regex_permission,
-)
-
-# user prompt management
-app.add_url_rule(rule=routes.USER_PROMPT_PERMISSIONS, methods=["GET"], view_func=views.list_user_prompts)
-app.add_url_rule(rule=routes.USER_PROMPT_PERMISSION_DETAIL, methods=["POST"], view_func=views.create_prompt_permission)
-app.add_url_rule(rule=routes.USER_PROMPT_PERMISSION_DETAIL, methods=["GET"], view_func=views.get_prompt_permission)
-app.add_url_rule(rule=routes.USER_PROMPT_PERMISSION_DETAIL, methods=["PATCH"], view_func=views.update_prompt_permission)
-app.add_url_rule(rule=routes.USER_PROMPT_PERMISSION_DETAIL, methods=["DELETE"], view_func=views.delete_prompt_permission)
-
-# user prompt regex permission management
-app.add_url_rule(rule=routes.USER_PROMPT_PATTERN_PERMISSIONS, methods=["GET"], view_func=views.list_prompt_regex_permissions)
-app.add_url_rule(rule=routes.USER_PROMPT_PATTERN_PERMISSIONS, methods=["POST"], view_func=views.create_prompt_regex_permission)
-app.add_url_rule(rule=routes.USER_PROMPT_PATTERN_PERMISSION_DETAIL, methods=["GET"], view_func=views.get_prompt_regex_permission)
-app.add_url_rule(rule=routes.USER_PROMPT_PATTERN_PERMISSION_DETAIL, methods=["PATCH"], view_func=views.update_prompt_regex_permission)
-app.add_url_rule(rule=routes.USER_PROMPT_PATTERN_PERMISSION_DETAIL, methods=["DELETE"], view_func=views.delete_prompt_regex_permission)
-
-# user registered model management
-app.add_url_rule(rule=routes.USER_REGISTERED_MODEL_PERMISSIONS, methods=["GET"], view_func=views.list_user_models)
-app.add_url_rule(rule=routes.USER_REGISTERED_MODEL_PERMISSION_DETAIL, methods=["POST"], view_func=views.create_registered_model_permission)
-app.add_url_rule(rule=routes.USER_REGISTERED_MODEL_PERMISSION_DETAIL, methods=["GET"], view_func=views.get_registered_model_permission)
-app.add_url_rule(rule=routes.USER_REGISTERED_MODEL_PERMISSION_DETAIL, methods=["PATCH"], view_func=views.update_registered_model_permission)
-app.add_url_rule(rule=routes.USER_REGISTERED_MODEL_PERMISSION_DETAIL, methods=["DELETE"], view_func=views.delete_registered_model_permission)
-
-# user registered model regex permission management
-app.add_url_rule(rule=routes.USER_REGISTERED_MODEL_PATTERN_PERMISSIONS, methods=["GET"], view_func=views.list_registered_model_regex_permissions)
-app.add_url_rule(rule=routes.USER_REGISTERED_MODEL_PATTERN_PERMISSIONS, methods=["POST"], view_func=views.create_registered_model_regex_permission)
-app.add_url_rule(rule=routes.USER_REGISTERED_MODEL_PATTERN_PERMISSION_DETAIL, methods=["GET"], view_func=views.get_registered_model_regex_permission)
-app.add_url_rule(rule=routes.USER_REGISTERED_MODEL_PATTERN_PERMISSION_DETAIL, methods=["PATCH"], view_func=views.update_registered_model_regex_permission)
-app.add_url_rule(rule=routes.USER_REGISTERED_MODEL_PATTERN_PERMISSION_DETAIL, methods=["DELETE"], view_func=views.delete_registered_model_regex_permission)
-
-app.add_url_rule(rule=routes.GROUP_USER_PERMISSIONS, methods=["GET"], view_func=views.get_group_users)
-
-app.add_url_rule(rule=routes.GROUP_EXPERIMENT_PERMISSIONS, methods=["GET"], view_func=views.list_group_experiments)
-app.add_url_rule(rule=routes.GROUP_EXPERIMENT_PERMISSION_DETAIL, methods=["POST"], view_func=views.create_group_experiment_permission)
-app.add_url_rule(rule=routes.GROUP_EXPERIMENT_PERMISSION_DETAIL, methods=["DELETE"], view_func=views.delete_group_experiment_permission)
-app.add_url_rule(rule=routes.GROUP_EXPERIMENT_PERMISSION_DETAIL, methods=["PATCH"], view_func=views.update_group_experiment_permission)
-
-app.add_url_rule(rule=routes.GROUP_REGISTERED_MODEL_PERMISSIONS, methods=["GET"], view_func=views.list_group_models)
-app.add_url_rule(rule=routes.GROUP_REGISTERED_MODEL_PERMISSION_DETAIL, methods=["POST"], view_func=views.create_group_model_permission)
-app.add_url_rule(rule=routes.GROUP_REGISTERED_MODEL_PERMISSION_DETAIL, methods=["DELETE"], view_func=views.delete_group_model_permission)
-app.add_url_rule(rule=routes.GROUP_REGISTERED_MODEL_PERMISSION_DETAIL, methods=["PATCH"], view_func=views.update_group_model_permission)
-
-app.add_url_rule(rule=routes.GROUP_PROMPT_PERMISSIONS, methods=["GET"], view_func=views.get_group_prompts)
-app.add_url_rule(rule=routes.GROUP_PROMPT_PERMISSION_DETAIL, methods=["POST"], view_func=views.create_group_prompt_permission)
-app.add_url_rule(rule=routes.GROUP_PROMPT_PERMISSION_DETAIL, methods=["DELETE"], view_func=views.delete_group_prompt_permission)
-app.add_url_rule(rule=routes.GROUP_PROMPT_PERMISSION_DETAIL, methods=["PATCH"], view_func=views.update_group_prompt_permission)
-
-app.add_url_rule(rule=routes.GROUP_EXPERIMENT_PATTERN_PERMISSIONS, methods=["GET"], view_func=views.list_group_experiment_regex_permissions)
-app.add_url_rule(rule=routes.GROUP_EXPERIMENT_PATTERN_PERMISSIONS, methods=["POST"], view_func=views.create_group_experiment_regex_permission)
-app.add_url_rule(rule=routes.GROUP_EXPERIMENT_PATTERN_PERMISSION_DETAIL, methods=["GET"], view_func=views.get_group_experiment_regex_permission)
-app.add_url_rule(
-    rule=routes.GROUP_EXPERIMENT_PATTERN_PERMISSION_DETAIL,
-    methods=["PATCH"],
-    view_func=views.update_group_experiment_regex_permission,
-)
-app.add_url_rule(
-    rule=routes.GROUP_EXPERIMENT_PATTERN_PERMISSION_DETAIL,
-    methods=["DELETE"],
-    view_func=views.delete_group_experiment_regex_permission,
-)
-
-app.add_url_rule(
-    rule=routes.GROUP_REGISTERED_MODEL_PATTERN_PERMISSIONS,
-    methods=["POST"],
-    view_func=views.create_group_registered_model_regex_permission,
-)
-app.add_url_rule(
-    rule=routes.GROUP_REGISTERED_MODEL_PATTERN_PERMISSIONS,
-    methods=["GET"],
-    view_func=views.list_group_registered_model_regex_permissions,
-)
-app.add_url_rule(
-    rule=routes.GROUP_REGISTERED_MODEL_PATTERN_PERMISSION_DETAIL,
-    methods=["GET"],
-    view_func=views.get_group_registered_model_regex_permission,
-)
-app.add_url_rule(
-    rule=routes.GROUP_REGISTERED_MODEL_PATTERN_PERMISSION_DETAIL,
-    methods=["PATCH"],
-    view_func=views.update_group_registered_model_regex_permission,
-)
-app.add_url_rule(
-    rule=routes.GROUP_REGISTERED_MODEL_PATTERN_PERMISSION_DETAIL,
-    methods=["DELETE"],
-    view_func=views.delete_group_registered_model_regex_permission,
-)
-
-app.add_url_rule(rule=routes.GROUP_PROMPT_PATTERN_PERMISSIONS, methods=["GET"], view_func=views.list_group_prompt_regex_permissions)
-app.add_url_rule(rule=routes.GROUP_PROMPT_PATTERN_PERMISSIONS, methods=["POST"], view_func=views.create_group_prompt_regex_permission)
-app.add_url_rule(rule=routes.GROUP_PROMPT_PATTERN_PERMISSION_DETAIL, methods=["GET"], view_func=views.get_group_prompt_regex_permission)
-app.add_url_rule(rule=routes.GROUP_PROMPT_PATTERN_PERMISSION_DETAIL, methods=["PATCH"], view_func=views.update_group_prompt_regex_permission)
-app.add_url_rule(rule=routes.GROUP_PROMPT_PATTERN_PERMISSION_DETAIL, methods=["DELETE"], view_func=views.delete_group_prompt_regex_permission)
-###############################
+    Returns:
+        True if OIDC was successfully registered during app startup.
+    """
+    return _oidc_initialized
 
 
-# Add new hooks
-app.before_request(before_request_hook)
-app.after_request(after_request_hook)
+def get_oidc_provider_status() -> dict[str, bool]:
+    """Per-provider registration outcome from startup.
 
-# Set up session
-Session(app)
-cache = Cache(app)
+    ``is_oidc_ready()`` alone cannot express a partial failure, and with several providers a
+    partial failure is an expected state rather than an exceptional one.
+    """
+    return dict(_oidc_provider_status)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """FastAPI lifespan context manager for startup/shutdown events.
+
+    Ensures OIDC client is registered at startup before the app accepts requests.
+    This is critical for multi-replica deployments where any replica may receive
+    /callback or /logout requests that require the OIDC client to be registered.
+    """
+    global _oidc_initialized, _oidc_provider_status
+
+    # Startup: Register OIDC client
+    logger.info("Starting MLflow OIDC Auth Plugin...")
+    # Every provider is registered independently, so one that is misconfigured or whose
+    # discovery document is unreachable does not disable login for the others (#315).
+    results = ensure_all_clients_registered()
+    _oidc_provider_status = results
+    registered = [provider_id for provider_id, ok in results.items() if ok]
+    failed = [provider_id for provider_id, ok in results.items() if not ok]
+
+    if registered:
+        _oidc_initialized = True
+        logger.info("OIDC client(s) successfully registered at startup: %s", ", ".join(sorted(registered)))
+    if failed:
+        logger.warning(
+            "OIDC client registration failed at startup for: %s. "
+            "This may indicate missing configuration (OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_DISCOVERY_URL, "
+            "or OIDC_CLIENT_SECRET_<PROVIDER_ID> for an additional provider). "
+            "Those providers will not be available until configuration is corrected.",
+            ", ".join(sorted(failed)),
+        )
+    if not results:
+        logger.warning(
+            "No OIDC client was registered at startup. "
+            "This may indicate missing configuration (OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_DISCOVERY_URL). "
+            "OIDC authentication will not be available until configuration is corrected."
+        )
+
+    yield  # App runs here
+
+    # Shutdown: Cleanup if needed
+    logger.info("Shutting down MLflow OIDC Auth Plugin...")
+
+
+def _seed_default_workspace() -> None:
+    """Seed the default workspace in MLflow's workspace store if it doesn't already exist.
+
+    Called at app startup when MLFLOW_ENABLE_WORKSPACES is enabled.
+    Uses MLflow's native workspace store API to create the 'default' workspace.
+    """
+    from mlflow.server.handlers import _get_workspace_store
+    from mlflow.store.workspace import Workspace
+
+    DEFAULT_WORKSPACE = "default"
+
+    try:
+        ws_store = _get_workspace_store()
+        # Check if default workspace already exists
+        try:
+            ws_store.get_workspace(DEFAULT_WORKSPACE)
+            logger.debug(f"Default workspace '{DEFAULT_WORKSPACE}' already exists")
+        except Exception:
+            # Workspace doesn't exist — create it
+            ws_store.create_workspace(
+                Workspace(
+                    name=DEFAULT_WORKSPACE,
+                    description="Default workspace",
+                )
+            )
+            logger.info(f"Default workspace '{DEFAULT_WORKSPACE}' created")
+    except Exception as e:
+        logger.warning(f"Could not seed default workspace: {e}")
+
+
+def _include_router(oidc_app: FastAPI, router: APIRouter) -> None:
+    """Register a router, plus the "/ajax-api" twins of its "/api" routes.
+
+    MLflow's web UI calls "/ajax-api/..." while API clients call "/api/...".
+    Registering both keeps UI-facing endpoints reachable; see
+    `mlflow_oidc_auth.routers.ajax_alias_router`.
+    """
+    oidc_app.include_router(router)
+    alias = ajax_alias_router(router)
+    if alias.routes:
+        oidc_app.include_router(alias)
+
+
+def _include_mlflow_fastapi_routers(oidc_app: FastAPI) -> None:
+    """Include MLflow's FastAPI-native routers in our application.
+
+    These routers serve endpoints that are NOT handled by Flask and must be
+    registered directly on the FastAPI app.  They are included BEFORE the
+    Flask WSGI mount so FastAPI routes take precedence.
+
+    Each router is imported and included individually with graceful fallback
+    so the plugin continues to work if a particular MLflow module is missing
+    (e.g. older MLflow versions without the assistant or job API).
+    """
+    # OTel trace ingestion: /v1/traces
+    try:
+        from mlflow.server.otel_api import otel_router
+
+        oidc_app.include_router(otel_router)
+        logger.info("Included MLflow OTel router (/v1/traces)")
+    except ImportError:
+        logger.debug("mlflow.server.otel_api not available — OTel endpoints disabled")
+
+    # Job API: /ajax-api/3.0/jobs/*
+    try:
+        from mlflow.server.job_api import job_api_router
+
+        oidc_app.include_router(job_api_router)
+        logger.info("Included MLflow Job API router (/ajax-api/3.0/jobs)")
+    except ImportError:
+        logger.debug("mlflow.server.job_api not available — Job API endpoints disabled")
+
+    # AI Gateway invocations: /gateway/*
+    try:
+        from mlflow.server.gateway_api import gateway_router
+
+        oidc_app.include_router(gateway_router)
+        logger.info("Included MLflow Gateway router (/gateway)")
+    except ImportError:
+        logger.debug("mlflow.server.gateway_api not available — Gateway endpoints disabled")
+
+    # AI Assistant: /ajax-api/3.0/mlflow/assistant/*
+    try:
+        from mlflow.server.assistant.api import assistant_router
+
+        oidc_app.include_router(assistant_router)
+        logger.info("Included MLflow Assistant router (/ajax-api/3.0/mlflow/assistant)")
+    except ImportError:
+        logger.debug("mlflow.server.assistant.api not available — Assistant endpoints disabled")
+
+
+def create_app() -> FastAPI:
+    """Create a FastAPI application with OIDC integration.
+
+    The app uses a lifespan context manager to ensure OIDC client registration
+    happens at startup, making the app ready for multi-replica deployments.
+    """
+    oidc_app = FastAPI(
+        title="MLflow Tracking Server with OIDC Auth",
+        description="MLflow Tracking Server API with OIDC Authentication",
+        version=VERSION,
+        docs_url="/docs" if config.ENABLE_API_DOCS else None,
+        redoc_url="/redoc" if config.ENABLE_API_DOCS else None,
+        openapi_url="/openapi.json" if config.ENABLE_API_DOCS else None,
+        lifespan=lifespan,
+    )
+    register_exception_handlers(oidc_app)
+
+    # ---------------------------------------------------------------------------
+    # Middleware ordering (Starlette executes LAST-added as OUTERMOST):
+    #
+    #   Request → Session → WorkspaceContext → Auth → ProxyHeaders
+    #             → PermissionMiddleware → route handler
+    #
+    # PermissionMiddleware MUST be added FIRST (innermost) so it runs AFTER
+    # AuthMiddleware has set request.state.username / is_admin.
+    # ---------------------------------------------------------------------------
+    add_fastapi_permission_middleware(oidc_app)
+    oidc_app.add_middleware(ProxyHeadersMiddleware)
+    oidc_app.add_middleware(AuthMiddleware)
+    oidc_app.add_middleware(WorkspaceContextMiddleware)
+    oidc_app.add_middleware(
+        StarletteSessionMiddleware,
+        secret_key=config.SECRET_KEY,
+        session_cookie=config.SESSION_COOKIE_NAME,
+        max_age=config.SESSION_COOKIE_MAX_AGE_SECONDS,
+        same_site=config.SESSION_COOKIE_SAMESITE,
+        https_only=config.SESSION_COOKIE_SECURE,
+    )
+
+    for router in get_all_routers():
+        _include_router(oidc_app, router)
+
+    # Inject into MLflow's index.html when the menu links or the re-auth helper
+    # are enabled. Both live in the same hack module to keep injection ordering
+    # predictable.
+    if config.EXTEND_MLFLOW_MENU or config.EXTEND_MLFLOW_REAUTH:
+        from mlflow_oidc_auth import hack
+
+        app.view_functions["serve"] = hack.index
+
+    # Set Flask app secret key
+    app.secret_key = config.SECRET_KEY
+
+    # Register Flask hooks directly with the Flask app
+    app.before_request(before_request_hook)
+    app.after_request(after_request_hook)
+
+    # Seed default workspace and register workspace routers when workspaces are enabled (WSFND-04)
+    if config.MLFLOW_ENABLE_WORKSPACES:
+        _seed_default_workspace()
+        # Register all workspace routers only when workspaces are enabled
+        from mlflow_oidc_auth.routers.workspace_permissions import (
+            workspace_permissions_router,
+        )
+        from mlflow_oidc_auth.routers.workspace_regex_permissions import (
+            workspace_regex_permissions_router,
+        )
+
+        _include_router(oidc_app, workspace_permissions_router)
+        _include_router(oidc_app, workspace_regex_permissions_router)
+
+    # ---------------------------------------------------------------------------
+    # Include MLflow's FastAPI-native routers (GAP-ARCH-01 fix)
+    #
+    # These routers serve endpoints that bypass Flask entirely:
+    #   - otel_router:      /v1/traces — OpenTelemetry trace ingestion
+    #   - gateway_router:   /gateway/* — AI Gateway invocations
+    #   - assistant_router: /ajax-api/3.0/mlflow/assistant/* — AI assistant
+    #   - job_api_router:   /ajax-api/3.0/jobs/* — Job API
+    #
+    # They MUST be included BEFORE the Flask WSGI mount so FastAPI routes
+    # take precedence over the catch-all Flask mount.
+    # ---------------------------------------------------------------------------
+    _include_mlflow_fastapi_routers(oidc_app)
+
+    # Mount Flask app at root with auth passing middleware
+    oidc_app.mount("/", AuthAwareWSGIMiddleware(app))
+
+    logger.info("MLflow Flask app mounted at / with FastAPI auth info passing")
+    # Ensure MLflow's `/graphql` route applies our per-field authorization middleware.
+    install_mlflow_graphql_authorization_middleware()
+
+    return oidc_app
+
+
+app = create_app()

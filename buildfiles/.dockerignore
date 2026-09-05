@@ -1,5 +1,7 @@
 .venv
 venv
+node_modules
+coverage
 .gitignore
 .DS_Store
 readme.md

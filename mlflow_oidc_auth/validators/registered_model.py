@@ -1,70 +1,99 @@
-from flask import request
-from mlflow.exceptions import MlflowException
-
+from mlflow_oidc_auth.config import config
 from mlflow_oidc_auth.permissions import Permission
-from mlflow_oidc_auth.utils import effective_registered_model_permission, effective_experiment_permission, get_username, get_model_name, get_model_id, get_is_admin
+from mlflow_oidc_auth.utils import (
+    effective_registered_model_permission,
+    effective_new_registered_model_permission,
+    effective_experiment_permission,
+    get_model_name,
+    get_model_id,
+    get_request_param,
+)
 from mlflow.server.handlers import _get_tracking_store
 
 
-def _get_permission_from_registered_model_name() -> Permission:
+def _get_permission_from_registered_model_name(username: str) -> Permission:
     model_name = get_model_name()
-    username = get_username()
     return effective_registered_model_permission(model_name, username).permission
 
 
-def _get_permission_from_model_id() -> Permission:
+def _get_permission_from_model_id(username: str) -> Permission:
     # logged model permissions inherit from parent resource (experiment)
     model_id = get_model_id()
     model = _get_tracking_store().get_logged_model(model_id)
     experiment_id = model.experiment_id
-    username = get_username()
     return effective_experiment_permission(experiment_id, username).permission
 
 
-def validate_can_read_registered_model():
-    return _get_permission_from_registered_model_name().can_read
-
-
-def validate_can_update_registered_model():
-    return _get_permission_from_registered_model_name().can_update
-
-
-def validate_can_delete_registered_model():
-    return _get_permission_from_registered_model_name().can_delete
-
-
-def validate_can_manage_registered_model():
-    """Validate permission for a specific registered model (requires model_name)."""
-    return _get_permission_from_registered_model_name().can_manage
-
-
-def validate_can_list_user_registered_model_permissions():
-    """Validate permission to list registered model permissions for a user.
-    
-    This is for LIST endpoints like:
-    - GET /api/2.0/mlflow/permissions/users/<username>/registered-models
-    - GET /api/2.0/mlflow/permissions/users/<username>/prompts
-    
-    Returns True if:
-    - User is admin, OR
-    - User is requesting their own permissions
+def _get_permission_from_model_version(username: str) -> Permission:
     """
-    username = get_username()
-    requested_user = request.view_args.get('username')
-    return get_is_admin() or username == requested_user
+    Get permission for model version artifacts.
+    Model versions inherit permissions from their registered model.
+    """
+    return _get_permission_from_registered_model_name(username)
 
 
-def validate_can_read_logged_model():
-    return _get_permission_from_model_id().can_read
+def _get_permission_from_trace_request_id(username: str) -> Permission:
+    """
+    Get permission for trace artifacts.
+    Traces inherit permissions from their parent run/experiment.
+    """
+    request_id = get_request_param("request_id")
+    # Get the trace to find its experiment
+    trace = _get_tracking_store().get_trace_info(request_id)
+    experiment_id = trace.experiment_id
+
+    return effective_experiment_permission(experiment_id, username).permission
 
 
-def validate_can_update_logged_model():
-    return _get_permission_from_model_id().can_update
+def validate_can_read_registered_model(username: str) -> bool:
+    return _get_permission_from_registered_model_name(username).can_read
 
 
-def validate_can_delete_logged_model():
-    return _get_permission_from_model_id().can_delete
+def validate_can_update_registered_model(username: str) -> bool:
+    return _get_permission_from_registered_model_name(username).can_update
 
 
-def validate_can_manage_logged_model():
-    return _get_permission_from_model_id().can_manage
+def validate_can_delete_registered_model(username: str) -> bool:
+    return _get_permission_from_registered_model_name(username).can_delete
+
+
+def validate_can_manage_registered_model(username: str) -> bool:
+    return _get_permission_from_registered_model_name(username).can_manage
+
+
+def validate_can_read_logged_model(username: str) -> bool:
+    return _get_permission_from_model_id(username).can_read
+
+
+def validate_can_update_logged_model(username: str) -> bool:
+    return _get_permission_from_model_id(username).can_update
+
+
+def validate_can_delete_logged_model(username: str) -> bool:
+    return _get_permission_from_model_id(username).can_delete
+
+
+def validate_can_manage_logged_model(username: str) -> bool:
+    return _get_permission_from_model_id(username).can_manage
+
+
+def validate_can_read_model_version_artifact(username: str) -> bool:
+    """Checks READ permission on model version artifacts."""
+    return _get_permission_from_model_version(username).can_read
+
+
+def validate_can_read_trace_artifact(username: str) -> bool:
+    """Checks READ permission on trace artifacts."""
+    return _get_permission_from_trace_request_id(username).can_read
+
+
+def validate_can_create_registered_model(username: str) -> bool:
+    """Authorize CreateRegisteredModel when RESTRICT_RESOURCE_CREATION is enabled.
+
+    No-op (allow) unless the flag is set. When set, the user needs EDIT+ for the
+    new model name, resolved from name regex / group-regex with a workspace fallback.
+    """
+    if not config.RESTRICT_RESOURCE_CREATION:
+        return True
+    model_name = get_model_name()
+    return effective_new_registered_model_permission(model_name, username).permission.can_update

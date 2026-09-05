@@ -3,9 +3,15 @@
 [![PyPI Downloads](https://static.pepy.tech/badge/mlflow-oidc-auth/month)](https://pepy.tech/projects/mlflow-oidc-auth)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/mlflow-oidc/mlflow-oidc-auth)
 
-MLflow auth plugin to use OpenID Connect (OIDC) as authentication and authorization provider.
+OpenID Connect (OIDC) authentication and authorization plugin for MLflow.
 
 This plugin allows you to use OIDC for user management in MLflow, enabling single sign-on (SSO) capabilities and centralized user management.
+
+## Disclaimer
+
+This project is not affiliated with, endorsed by, or sponsored by the MLflow Project, Databricks, the Linux Foundation, or LF Projects, LLC.
+MLflow and related marks are trademarks of their respective owners.
+Maintained by Kharkevich Engineering Lab.
 
 ### Features
 - OIDC-based authentication for MLflow UI and API
@@ -30,9 +36,22 @@ python3 -m pip install mlflow-oidc-auth[full]
 mlflow server --app-name oidc-auth --host 0.0.0.0 --port 8080
 ```
 
+## Webhook secret encryption key 🔐
+
+Webhook secrets are stored encrypted in the database using a Fernet key. If you plan to use MLflow webhooks with secrets, set the encryption key in the environment variable `MLFLOW_WEBHOOK_SECRET_ENCRYPTION_KEY` before creating any webhooks. Generate a key with:
+
+```bash
+MLFLOW_WEBHOOK_SECRET_ENCRYPTION_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+export MLFLOW_WEBHOOK_SECRET_ENCRYPTION_KEY
+```
+
+Important: keep this key stable across application restarts and replicas. If the key is lost or changed after webhooks are created, previously stored secrets cannot be decrypted and will cause webhook listing to fail until you restore the original key or remove/rotate the affected webhook secrets.
+
+
 ## Development
 
 For development quick start, please refer to the [Development and Contribution](docs/development.md) section.
+Contribution guidelines are available in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

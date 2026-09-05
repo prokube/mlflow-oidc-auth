@@ -1,21 +1,21 @@
 # Build Files
 
-Docker build configuration for mlflow-oidc-auth with ProKube security fixes.
+Docker build configuration for the prokube mlflow-oidc-auth image.
 
 ## Why Custom Dockerfile?
 
-The upstream [mlflow-tracking-server-docker](https://github.com/mlflow-oidc/mlflow-tracking-server-docker) expects mlflow-oidc-auth to be available on PyPI. 
+The upstream [mlflow-tracking-server-docker](https://github.com/mlflow-oidc/mlflow-tracking-server-docker) expects mlflow-oidc-auth to be available on PyPI.
 
 We need these modifications to build directly from source (without PyPI package):
-- Install Node.js/Yarn to build the Angular web-ui from source
+- Install Node.js/Yarn to build the React UI from source
 - Copy and install local mlflow-oidc-auth code
-- Build and bundle the web-ui into the package
+- Build and bundle the UI into the package
 
 ## Files
 
 - **Dockerfile**: Modified version of upstream Dockerfile
   - Added Node.js/Yarn installation
-  - Added web-ui build steps
+  - Added React UI build steps
   - Installs mlflow-oidc-auth from local source
 
 - **pyproject.toml & uv.lock**: From upstream https://github.com/mlflow-oidc/mlflow-tracking-server-docker
@@ -27,12 +27,13 @@ We need these modifications to build directly from source (without PyPI package)
   - Runs docker build
   - Cleans up afterwards
 
-## Our Security Fixes
+## Versions
 
-- Security fixes for `list_users()` and `list_groups()` (non-admin users see only themselves)
-- User deletion with cascade delete of permissions
-- Validator fixes for permission LIST endpoints
-- MLflow 3.6.0 + mlflow-oidc-auth 5.7.0
+- MLflow 3.16.0
+- mlflow-oidc-auth 7.18.1 source
+
+The previous prokube authorization and user-deletion fixes are now implemented
+upstream and are covered by the upstream test suite.
 
 ## Build & Deploy
 
@@ -40,10 +41,8 @@ We need these modifications to build directly from source (without PyPI package)
 # Local build (run from buildfiles/ or repo root)
 ./buildfiles/build-locally.sh
 
-# Tag and push
-docker tag mlflow-oidc-auth-fixed:latest \
-  europe-west3-docker.pkg.dev/prokube-internal/prokube-customer/mlflow-tracking-server:v1.0.7
-docker push europe-west3-docker.pkg.dev/prokube-internal/prokube-customer/mlflow-tracking-server:v1.0.7
 ```
 
-CI/CD workflow builds automatically on push to `pk-internal-build-branch`.
+The GitHub workflow publishes images to the configured prokube Artifact Registry
+on pushes to `pk-internal-build-branch` and on version tags. Pull requests build
+the image without registry credentials and do not publish it.

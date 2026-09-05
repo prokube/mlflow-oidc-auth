@@ -15,16 +15,23 @@ from .data_fetching import (
     fetch_readable_experiments,
     fetch_readable_registered_models,
     fetch_readable_logged_models,
+    fetch_all_gateway_endpoints,
+    fetch_all_gateway_secrets,
+    fetch_all_gateway_model_definitions,
 )
 
 from .permissions import (
     effective_experiment_permission,
+    effective_new_experiment_permission,
+    effective_new_registered_model_permission,
     effective_registered_model_permission,
     effective_prompt_permission,
+    effective_scorer_permission,
     can_read_experiment,
     can_read_registered_model,
     can_manage_experiment,
     can_manage_registered_model,
+    can_manage_scorer,
     get_permission_from_store_or_default,
 )
 
@@ -33,24 +40,29 @@ from .request_helpers import (
     get_optional_url_param,
     get_request_param,
     get_optional_request_param,
-    get_username,
-    get_is_admin,
     get_experiment_id,
     get_model_id,
     get_model_name,
     _experiment_id_from_name,
 )
 
-from .decorators import (
-    check_experiment_permission,
-    check_registered_model_permission,
-    check_prompt_permission,
-    check_admin_permission,
+from .request_helpers_fastapi import (
+    get_username,
+    get_is_admin,
+    get_base_path,
+    is_authenticated,
 )
 
-from .uri_helpers import (
+
+from .uri import (
     get_configured_or_dynamic_redirect_uri,
     normalize_url_port,
+)
+
+from .oidc_field_extraction import (
+    extract_field_from_payload,
+    extract_username,
+    extract_display_name,
 )
 
 # Export everything for backward compatibility
@@ -64,14 +76,21 @@ __all__ = [
     "fetch_readable_experiments",
     "fetch_readable_registered_models",
     "fetch_readable_logged_models",
+    "fetch_all_gateway_endpoints",
+    "fetch_all_gateway_secrets",
+    "fetch_all_gateway_model_definitions",
     # Permissions
     "effective_experiment_permission",
+    "effective_new_experiment_permission",
+    "effective_new_registered_model_permission",
     "effective_registered_model_permission",
     "effective_prompt_permission",
+    "effective_scorer_permission",
     "can_read_experiment",
     "can_read_registered_model",
     "can_manage_experiment",
     "can_manage_registered_model",
+    "can_manage_scorer",
     "get_permission_from_store_or_default",
     # Request helpers
     "get_url_param",
@@ -84,12 +103,13 @@ __all__ = [
     "get_model_id",
     "get_model_name",
     "_experiment_id_from_name",
-    # Decorators
-    "check_experiment_permission",
-    "check_registered_model_permission",
-    "check_prompt_permission",
-    "check_admin_permission",
     # URI utilities
     "get_configured_or_dynamic_redirect_uri",
     "normalize_url_port",
+    "get_base_path",
+    "is_authenticated",
+    # OIDC field extraction
+    "extract_field_from_payload",
+    "extract_username",
+    "extract_display_name",
 ]
