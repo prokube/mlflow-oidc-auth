@@ -47,13 +47,15 @@ def _experiment_id_from_artifact_path(artifact_path: str):
          the shipped MANAGE default) while MLflow resolves it to "12/r/artifacts" and
          serves experiment 12's artifacts.
       2. ``_escape_control_characters``.
-      3. File URI handling. MLflow 3.16 canonicalizes relative ``file:`` values to
-         absolute paths and rejects them. Keeping this call aligned with the handler
-         ensures authorization never interprets a path MLflow will handle differently.
+      3. File URI handling. Depending on the Python platform, MLflow 3.16 may
+         canonicalize relative ``file:`` values to absolute paths and reject them, or
+         leave them relative. Keeping this call aligned with the handler ensures the
+         authorization parser sees the same normalized value when one is returned.
 
-    ``validate_path_is_safe`` RAISES for the paths MLflow refuses outright ("..", "#").
-    Those fall through to the raw value below, which is safe: MLflow rejects such a
-    request with 400 before any artifact handler runs (issue #283).
+    ``validate_path_is_safe`` RAISES for paths MLflow refuses outright ("..", "#",
+    and platform-dependent absolute paths). Those fall through to the raw value below,
+    which cannot turn URI syntax into a numeric experiment segment; MLflow rejects the
+    request before serving an artifact (issue #283).
     """
     try:
         artifact_path = validate_path_is_safe(artifact_path)

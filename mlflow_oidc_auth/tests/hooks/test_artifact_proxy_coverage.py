@@ -330,16 +330,18 @@ class TestExperimentRootPathsResolve:
             "file:12/",
         ],
     )
-    def test_file_uri_scheme_is_rejected_by_mlflow(self, artifact_path):
-        """MLflow 3.16 rejects relative file URIs before serving artifacts."""
-        from mlflow.exceptions import MlflowException
-        from mlflow.utils.uri import validate_path_is_safe
+    def test_file_uri_scheme_never_resolves_as_an_experiment(self, artifact_path, monkeypatch):
+        """Relative file URIs never become a numeric experiment segment.
 
-        from mlflow_oidc_auth.validators.experiment import _experiment_id_from_artifact_path
+        MLflow 3.16 rejects these after canonicalizing them to absolute paths on some
+        Python platforms, but returns them unchanged on others. Authorization must be
+        safe under either behavior.
+        """
+        from mlflow_oidc_auth.validators import experiment
 
-        with pytest.raises(MlflowException, match="Invalid path"):
-            validate_path_is_safe(artifact_path)
-        assert _experiment_id_from_artifact_path(artifact_path) is None
+        # Exercise the Linux behavior where MLflow accepts the relative URI unchanged.
+        monkeypatch.setattr(experiment, "validate_path_is_safe", lambda path: path)
+        assert experiment._experiment_id_from_artifact_path(artifact_path) is None
 
     @pytest.mark.parametrize("default_permission", ["MANAGE", "NO_PERMISSIONS"])
     @pytest.mark.parametrize(
