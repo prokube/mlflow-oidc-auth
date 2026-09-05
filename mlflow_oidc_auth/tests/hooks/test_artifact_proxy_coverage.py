@@ -330,21 +330,18 @@ class TestExperimentRootPathsResolve:
             "file:12/",
         ],
     )
-    def test_file_uri_scheme_is_rejected_by_mlflow_316(self, artifact_path):
-        """MLflow 3.16 rejects relative file URIs instead of serving them.
+    def test_file_uri_scheme_resolves_the_experiment_mlflow_will_serve(self, artifact_path):
+        """MLflow strips a file: scheme before serving, so authorization must too.
 
-        ``local_file_uri_to_path`` now makes these paths absolute before the safety
-        check, so they cannot reach an artifact handler. Authorization must likewise
-        avoid attributing them to a caller-selected experiment.
+        validate_path_is_safe runs _decode -> _escape_control_characters ->
+        local_file_uri_to_path. Calling only _decode left "file:12/r/artifacts"
+        unresolved, which fell back to the MANAGE default and reopened the cross-tenant
+        read/write/delete this function exists to close. The scheme test runs after
+        decoding, so "FILE:" and "%66ile:" reach the same handler.
         """
-        from mlflow.exceptions import MlflowException
-        from mlflow.utils.uri import validate_path_is_safe
-
         from mlflow_oidc_auth.validators.experiment import _experiment_id_from_artifact_path
 
-        with pytest.raises(MlflowException):
-            validate_path_is_safe(artifact_path)
-        assert _experiment_id_from_artifact_path(artifact_path) is None
+        assert _experiment_id_from_artifact_path(artifact_path) == "12", f"{artifact_path!r} fell back to the permissive default"
 
     @pytest.mark.parametrize("default_permission", ["MANAGE", "NO_PERMISSIONS"])
     @pytest.mark.parametrize(
@@ -352,6 +349,8 @@ class TestExperimentRootPathsResolve:
         [
             ("/api/2.0/mlflow-artifacts/artifacts/12/r/a", "GET"),
             ("/api/2.0/mlflow-artifacts/artifacts/12/r/a", "DELETE"),
+            ("/api/2.0/mlflow-artifacts/artifacts/file:12/r/a", "GET"),
+            ("/api/2.0/mlflow-artifacts/artifacts/file:12/r/a", "DELETE"),
             ("/api/2.0/mlflow-artifacts/mpu/create/12/r/a", "POST"),
             ("/ajax-api/2.0/mlflow-artifacts/artifacts/12/r/a", "GET"),
         ],
