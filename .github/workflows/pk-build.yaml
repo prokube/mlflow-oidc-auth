@@ -8,6 +8,7 @@ on:
 
 env:
   IMAGE_NAME: "mlflow-oidc-auth"
+  MLFLOW_OIDC_AUTH_VERSION: "7.18.1"
   # MLflow v3.16.0
   MLFLOW_COMMIT: 998f7103eb5bb305491aa6e661e3862af0a8a8ed
 
@@ -91,6 +92,7 @@ jobs:
           cd ..
           uv sync --no-install-project --no-cache
           uv build
+          test -f "dist/mlflow_oidc_auth-${MLFLOW_OIDC_AUTH_VERSION}-py3-none-any.whl"
 
       - name: Auth GCloud CLI
         if: startsWith(github.ref, 'refs/tags/')
