@@ -115,8 +115,39 @@ Result: Access denied (NO_PERMISSIONS)
 ### Implications
 
 - Granting `MANAGE` on a workspace means the user can manage **all resources** in that workspace that lack more specific permissions
+- Granting `EDIT` on a workspace allows updating existing experiments and registered models (via workspace fallback) but **does not** allow creating new experiments or models
 - To restrict access to specific resources within a workspace, assign explicit resource-level permissions (they always take priority over the workspace fallback)
 - The workspace fallback only applies when `MLFLOW_ENABLE_WORKSPACES=true`
+
+### Creation vs Update Behavior
+
+With workspaces enabled, creation is intentionally stricter than update:
+
+- `CreateExperiment` requires workspace `MANAGE`
+- `CreateRegisteredModel` requires workspace `MANAGE`
+- Updating existing experiments/models follows normal permission resolution, so workspace `EDIT` fallback is sufficient for update operations when no resource-level override exists
+
+#### Hardening creation for clients that send no workspace context
+
+A client that omits the `X-MLFLOW-WORKSPACE` header still creates resources — MLflow resolves such a
+request to the `default` workspace. By default this path is not workspace-gated, which preserves
+backward compatibility. Two opt-in settings tighten it:
+
+- `OIDC_WORKSPACE_REQUIRE_CREATION_CONTEXT=true` rejects workspace-gated create requests that carry no
+  workspace context at all, forcing clients to be explicit about their target workspace.
+- `OIDC_WORKSPACE_DENY_DEFAULT_CREATION=true` rejects non-admin creates that land in the `default`
+  workspace. Because a request with no workspace context lands there too, this also covers clients
+  that omit the header — it cannot be bypassed by dropping the header.
+
+Admins bypass both guards. Enabling both gives the strictest posture: every non-admin create must name
+a non-default workspace on which the user holds `MANAGE`.
+
+This means the following setup allows users to edit existing resources but not create new ones:
+
+```bash
+MLFLOW_ENABLE_WORKSPACES=true
+OIDC_WORKSPACE_DEFAULT_PERMISSION=EDIT
+```
 
 ## `NO_PERMISSIONS` vs No Record
 
@@ -156,6 +187,8 @@ OIDC_WORKSPACE_DETECTION_PLUGIN=mypackage.workspace_detector
 # Permission level for auto-detected workspaces
 OIDC_WORKSPACE_DEFAULT_PERMISSION=READ
 ```
+
+If you set `OIDC_WORKSPACE_DEFAULT_PERMISSION=EDIT`, newly auto-assigned users can modify existing resources in that workspace but cannot create new experiments or registered models until granted workspace `MANAGE`.
 
 ## Workspace Permission Cache
 
@@ -228,3 +261,21 @@ Workspace lifecycle is handled by MLflow's native workspace API. The auth plugin
 | DELETE | `/api/3.0/mlflow/permissions/workspaces/regex/group/{id}` | Delete group regex permission |
 
 See the full [API Reference](api-reference) for request/response schemas.
+
+## Limitations and non-goals
+
+These are deliberate exclusions, not gaps. They are listed so you can plan around them rather
+than discover them.
+
+| Not supported | Why |
+|---|---|
+| Workspace hierarchy / nesting | MLflow's workspace model is flat. Nesting would make permission resolution exponentially more complex for a case MLflow itself does not represent. |
+| Moving a resource between workspaces | Not supported by MLflow — an experiment or model must be recreated in the target workspace. |
+| Per-workspace redefinition of RBAC levels | `READ` / `USE` / `EDIT` / `MANAGE` mean the same thing everywhere. Per-workspace semantics would make a permission audit unreadable. |
+| Per-workspace artifact store management in the UI | An MLflow core responsibility. `default_artifact_root` is set at creation time only. |
+| Workspace templates | Set up each workspace explicitly, or script it against the API. |
+| Workspace usage analytics | Not an authorization concern — use MLflow's own UI. |
+| Cross-instance workspace federation | This plugin secures a single MLflow instance. |
+
+Workspace CRUD always proxies through the MLflow API rather than writing to MLflow's store
+directly, so MLflow's own validation and constraints continue to apply.

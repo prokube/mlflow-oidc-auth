@@ -2,6 +2,11 @@
 
 An authentication and authorization plugin for [MLflow](https://mlflow.org/) that adds OpenID Connect (OIDC) single sign-on, role-based access control (RBAC), and per-resource permission management to MLflow tracking servers.
 
+## Disclaimer
+
+This project is not affiliated with, endorsed by, or sponsored by the MLflow Project, Databricks, the Linux Foundation, or LF Projects, LLC.
+MLflow and related marks are trademarks of their respective owners.
+
 ## Features
 
 - **OIDC single sign-on** — Authenticate users via any OpenID Connect provider (Keycloak, Okta, Auth0, Azure AD, Google, etc.)
@@ -92,7 +97,7 @@ Authentication context flows from FastAPI middleware through an ASGI-to-WSGI bri
 ## Requirements
 
 - Python >=3.10 (3.12 recommended)
-- MLflow >=3.10.0, <4
+- MLflow >=3.14.0, <4
 - An OIDC provider (Keycloak, Okta, Auth0, Azure AD, etc.)
 - Database: SQLite (default), PostgreSQL, or MySQL
 

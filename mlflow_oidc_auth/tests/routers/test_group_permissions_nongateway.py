@@ -12,6 +12,7 @@ from mlflow_oidc_auth.dependencies import (
     check_admin_permission,
     check_experiment_manage_permission,
 )
+from mlflow_oidc_auth.routers.group_permissions import list_groups
 
 GROUP_BASE = "/api/2.0/mlflow/permissions/groups"
 
@@ -113,6 +114,16 @@ class TestListGroups:
         with patch(f"{_GP}.store", mock_store):
             resp = authenticated_client.get(GROUP_BASE)
         assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_non_admin_only_sees_own_groups(self, mock_store):
+        """Non-admin users cannot enumerate groups they do not belong to."""
+        mock_store.get_groups_for_user.return_value = ["devs"]
+        with patch("mlflow_oidc_auth.store.store", mock_store):
+            result = await list_groups(username="alice@example.com", is_admin=False)
+
+        assert result.root == ["devs"]
+        mock_store.get_groups_for_user.assert_called_once_with("alice@example.com")
 
 
 # ========================================================================================

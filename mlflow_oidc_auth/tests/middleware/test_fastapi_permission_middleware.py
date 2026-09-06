@@ -5,9 +5,10 @@ This module tests the OIDC-aware permission middleware for FastAPI-native routes
 (gateway invocations, OTel trace ingestion, assistant, job API) that bypass Flask.
 """
 
-import pytest
+import base64
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse
@@ -484,3 +485,74 @@ class TestFastapiPermissionMiddlewareIntegration:
         client = TestClient(app)
         response = client.get("/gateway/my-ep/mlflow/invocations")
         assert response.status_code == 403
+
+
+class TestMlflow316NativeOtelIntegration:
+    """Exercise MLflow's native OTel router through the complete auth chain."""
+
+    @staticmethod
+    def _app():
+        from mlflow_oidc_auth.app import _include_mlflow_fastapi_routers
+        from mlflow_oidc_auth.middleware.auth_middleware import AuthMiddleware
+        from mlflow_oidc_auth.middleware.fastapi_permission_middleware import (
+            add_fastapi_permission_middleware,
+        )
+
+        app = FastAPI()
+        add_fastapi_permission_middleware(app)
+        app.add_middleware(AuthMiddleware)
+        _include_mlflow_fastapi_routers(app)
+        return app
+
+    @staticmethod
+    def _headers():
+        credentials = base64.b64encode(b"trace-writer:service-token").decode()
+        return {
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/x-protobuf",
+            "X-Mlflow-Experiment-Id": "42",
+        }
+
+    @staticmethod
+    def _service_account():
+        user = MagicMock()
+        user.active = True
+        user.is_admin = False
+        user.is_service_account = True
+        return user
+
+    @patch("mlflow_oidc_auth.middleware.auth_middleware.store")
+    @patch("mlflow_oidc_auth.utils.effective_experiment_permission")
+    def test_service_account_basic_auth_reaches_native_otel_route(self, mock_perm, mock_store):
+        """An authorized service account reaches MLflow's native OTel route."""
+        from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+            ExportTraceServiceRequest,
+        )
+
+        mock_store.authenticate_user.return_value = True
+        mock_store.get_user_profile.return_value = self._service_account()
+        mock_perm.return_value.permission.can_update = True
+
+        response = TestClient(self._app()).post(
+            "/v1/traces",
+            headers=self._headers(),
+            content=ExportTraceServiceRequest().SerializeToString(),
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {"detail": "Invalid OpenTelemetry format - no spans found"}
+        mock_store.authenticate_user.assert_called_once_with("trace-writer", "service-token")
+        mock_perm.assert_called_once_with("42", "trace-writer")
+
+    @patch("mlflow_oidc_auth.middleware.auth_middleware.store")
+    @patch("mlflow_oidc_auth.utils.effective_experiment_permission")
+    def test_service_account_otel_authorization_fails_closed(self, mock_perm, mock_store):
+        """Authorization lookup errors deny before MLflow handles the request."""
+        mock_store.authenticate_user.return_value = True
+        mock_store.get_user_profile.return_value = self._service_account()
+        mock_perm.side_effect = RuntimeError("permission store unavailable")
+
+        response = TestClient(self._app()).post("/v1/traces", headers=self._headers(), content=b"")
+
+        assert response.status_code == 403
+        assert response.text == "Permission denied"

@@ -3,8 +3,15 @@
 ## Requirements
 
 - Python >=3.10 (3.12 recommended)
-- MLflow >=3.10.0, <4
+- MLflow >=3.14.0, <4
 - An OIDC-compatible identity provider (Keycloak, Okta, Auth0, Azure AD, Google, etc.)
+
+> **Upgrading from an MLflow 3.10–3.13 deployment:** MLflow 3.14 puts the filesystem
+> tracking and model registry backends (the default `./mlruns` directory) into maintenance
+> mode and refuses to start against them. Migrate to a database backend before upgrading —
+> `mlflow migrate-filestore` moves existing data losslessly — or set
+> `MLFLOW_ALLOW_FILE_STORE=true` to opt out of the check. This affects MLflow's own storage,
+> not the plugin's `OIDC_USERS_DB_URI` auth database.
 
 ## Package Installation
 
@@ -18,7 +25,7 @@ Includes the complete MLflow package with the UI:
 pip install "mlflow-oidc-auth"
 ```
 
-Since `mlflow>=3.10.0` is a dependency, the full MLflow package (including the tracking UI) is installed automatically.
+Since `mlflow>=3.14.0` is a dependency, the full MLflow package (including the tracking UI) is installed automatically.
 
 ### With Cloud Provider Support
 
@@ -53,7 +60,7 @@ Before starting the server, register a client application with your OIDC provide
 2. **Grant type**: Authorization Code
 3. **Redirect URI**: `https://your-mlflow-host/callback`
 4. **Scopes**: `openid`, `email`, `profile`
-5. **Token claims**: The ID token must include `email` (or `preferred_username`) and `groups`
+5. **Token claims**: The ID token must include `email` (or `preferred_username`) and `groups`. The claim(s) used for the login identity are configurable via `OIDC_USERNAME_FIELD` — see [Configuration Reference](configuration#oidc-authentication)
 
 ### Provider-Specific Notes
 

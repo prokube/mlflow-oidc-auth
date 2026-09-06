@@ -547,6 +547,68 @@ class TestResolvePermissionWorkspaceFallback(unittest.TestCase):
         self.assertEqual(result.permission, EDIT)
 
     @patch("mlflow_oidc_auth.utils.permissions.get_permission_from_store_or_default")
+    def test_workspace_edit_fallback_allows_experiment_update_but_not_manage(self, mock_resolver):
+        """Workspace EDIT fallback grants update capability for existing experiments but not manage."""
+        from mlflow_oidc_auth.permissions import EDIT, READ
+
+        mock_builder = MagicMock()
+        mock_sources = {"user": MagicMock()}
+        mock_builder.return_value = mock_sources
+        mock_resolver.return_value = PermissionResult(READ, "fallback")
+
+        with patch.dict(
+            "mlflow_oidc_auth.utils.permissions.PERMISSION_REGISTRY",
+            {"experiment": mock_builder},
+        ):
+            with patch("mlflow_oidc_auth.utils.permissions.config") as mock_config:
+                mock_config.MLFLOW_ENABLE_WORKSPACES = True
+                with patch(
+                    "mlflow_oidc_auth.bridge.user.get_request_workspace",
+                    return_value="team-ws",
+                ):
+                    with patch(
+                        "mlflow_oidc_auth.utils.workspace_cache.get_workspace_permission_cached",
+                        return_value=EDIT,
+                    ):
+                        result = resolve_permission("experiment", "exp-1", "user1")
+
+        self.assertEqual(result.kind, "workspace")
+        self.assertEqual(result.permission, EDIT)
+        self.assertTrue(result.permission.can_update)
+        self.assertFalse(result.permission.can_manage)
+
+    @patch("mlflow_oidc_auth.utils.permissions.get_permission_from_store_or_default")
+    def test_workspace_edit_fallback_allows_registered_model_update_but_not_manage(self, mock_resolver):
+        """Workspace EDIT fallback grants update capability for existing models but not manage."""
+        from mlflow_oidc_auth.permissions import EDIT, READ
+
+        mock_builder = MagicMock()
+        mock_sources = {"user": MagicMock()}
+        mock_builder.return_value = mock_sources
+        mock_resolver.return_value = PermissionResult(READ, "fallback")
+
+        with patch.dict(
+            "mlflow_oidc_auth.utils.permissions.PERMISSION_REGISTRY",
+            {"registered_model": mock_builder},
+        ):
+            with patch("mlflow_oidc_auth.utils.permissions.config") as mock_config:
+                mock_config.MLFLOW_ENABLE_WORKSPACES = True
+                with patch(
+                    "mlflow_oidc_auth.bridge.user.get_request_workspace",
+                    return_value="team-ws",
+                ):
+                    with patch(
+                        "mlflow_oidc_auth.utils.workspace_cache.get_workspace_permission_cached",
+                        return_value=EDIT,
+                    ):
+                        result = resolve_permission("registered_model", "model-a", "user1")
+
+        self.assertEqual(result.kind, "workspace")
+        self.assertEqual(result.permission, EDIT)
+        self.assertTrue(result.permission.can_update)
+        self.assertFalse(result.permission.can_manage)
+
+    @patch("mlflow_oidc_auth.utils.permissions.get_permission_from_store_or_default")
     def test_fallback_workspaces_enabled_no_permission_returns_no_permissions(self, mock_resolver):
         """When fallback + workspaces enabled + no workspace perm → returns NO_PERMISSIONS."""
         from mlflow_oidc_auth.permissions import NO_PERMISSIONS, READ
@@ -624,3 +686,60 @@ class TestResolvePermissionWorkspaceFallback(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPermissionCacheWorkspaceKey:
+    """The cache key must describe what resolve_permission actually did."""
+
+    def test_headerless_and_explicit_default_do_not_share_a_cache_entry(self):
+        """A header-less request skips the workspace check; an explicit default does not.
+
+        Keying both as "default" served the header-less fallback to the explicit-default
+        request, silently granting access that should have been workspace-denied.
+        """
+        from unittest.mock import patch
+
+        from mlflow_oidc_auth.utils import permissions as perms
+
+        calls = []
+
+        def fake_builder(resource_id, username, **kwargs):
+            calls.append((resource_id, username))
+            return {}
+
+        with (
+            patch.dict(perms.PERMISSION_REGISTRY, {"experiment": fake_builder}),
+            patch.object(perms.config, "MLFLOW_ENABLE_WORKSPACES", True),
+            patch.object(
+                perms,
+                "get_permission_from_store_or_default",
+                return_value=perms.PermissionResult(perms.get_permission("READ"), "fallback"),
+            ),
+        ):
+            perms._get_permission_cache().clear()
+
+            with patch("mlflow_oidc_auth.bridge.user.get_request_workspace", return_value=None):
+                headerless = perms.resolve_permission("experiment", "1", "bob")
+
+            with (
+                patch("mlflow_oidc_auth.bridge.user.get_request_workspace", return_value="default"),
+                patch("mlflow_oidc_auth.utils.workspace_cache.get_workspace_permission_cached", return_value=None),
+            ):
+                explicit_default = perms.resolve_permission("experiment", "1", "bob")
+
+        assert headerless.kind == "fallback"
+        assert explicit_default.kind == "workspace-deny"
+        assert explicit_default.permission == perms.NO_PERMISSIONS
+        assert len(calls) == 2, "the two requests shared a cache entry"
+
+    def test_distinct_workspaces_do_not_share_a_cache_entry(self):
+        """The same resource id denotes different entities in different workspaces."""
+        from unittest.mock import patch
+
+        from mlflow_oidc_auth.utils import permissions as perms
+
+        assert perms._make_cache_key("experiment", "1", "bob", "ws-a") != perms._make_cache_key("experiment", "1", "bob", "ws-b")
+
+        with patch.object(perms.config, "MLFLOW_ENABLE_WORKSPACES", False):
+            assert perms._get_cache_workspace() is None
+            assert perms._make_cache_key("experiment", "1", "bob", None) == "experiment:1:bob"

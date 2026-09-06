@@ -1,4 +1,4 @@
-from flask import Response, g, request
+from flask import Response, g, has_app_context, request
 from mlflow.protos.model_registry_pb2 import (
     CreateRegisteredModel,
     DeleteRegisteredModel,
@@ -172,13 +172,31 @@ def _can_access_workspace(username: str, workspace: str | None) -> bool:
     - Workspaces are disabled (MLFLOW_ENABLE_WORKSPACES is False)
     - Resource has no workspace assignment (pre-workspace-era, WSSEC-05)
     - User has at least READ workspace permission via get_workspace_permission_cached (WSSEC-01/02/03/04)
+
+    Memoized for the current request. ``get_workspace_permission_cached`` deliberately
+    does not cache DENIALS, so a user with no grant on the workspace re-ran the full
+    source walk for every row of a search result. The memo uses the same request-scoped
+    dict as the ``_cached_can_read_*`` helpers, so it adds no new staleness window
+    (issue #253).
     """
     if not config.MLFLOW_ENABLE_WORKSPACES:
         return True
     if not workspace:
         return True  # Pre-workspace-era resource (WSSEC-05)
-    perm = get_workspace_permission_cached(username, workspace)
-    return perm is not None and perm.can_read
+
+    def _lookup() -> bool:
+        perm = get_workspace_permission_cached(username, workspace)
+        return perm is not None and perm.can_read
+
+    # The memo is an optimization, not a requirement: outside a Flask request context
+    # (direct calls, tests) fall through to the uncached lookup rather than failing.
+    if not has_app_context():
+        return _lookup()
+    cache = _get_request_permission_cache()
+    key = ("ws", workspace, username)
+    if key not in cache:
+        cache[key] = _lookup()
+    return cache[key]
 
 
 def _filter_search_experiments(resp: Response):
@@ -703,6 +721,24 @@ AFTER_REQUEST_PATH_HANDLERS = {
     DeleteWorkspace: _cascade_delete_workspace_permissions,
 }
 
+# Create endpoints whose after-request handler auto-grants the creator MANAGE via a
+# get_user lookup. If the authenticated user has no permission-DB record yet, that grant
+# fails *after* MLflow has already committed the resource, leaving it ownerless (issue #262).
+# before_request uses this set to reject such creates pre-commit. Derived from the handler
+# map so a newly added create type is covered automatically.
+CREATOR_GRANT_HANDLERS = frozenset(
+    {
+        _set_can_manage_experiment_permission,
+        _set_can_manage_registered_model_permission,
+        _set_can_manage_scorer_permission,
+        _set_can_manage_gateway_endpoint_permission,
+        _set_can_manage_gateway_secret_permission,
+        _set_can_manage_gateway_model_definition_permission,
+        _auto_grant_workspace_manage_permission,
+    }
+)
+CREATOR_GRANT_REQUEST_CLASSES = frozenset(proto for proto, handler in AFTER_REQUEST_PATH_HANDLERS.items() if handler in CREATOR_GRANT_HANDLERS)
+
 _our_handlers = set(AFTER_REQUEST_PATH_HANDLERS.values())
 AFTER_REQUEST_HANDLERS = {
     (http_path, method): handler
@@ -717,6 +753,13 @@ def after_request_hook(resp: Response):
     if 400 <= resp.status_code < 600:
         return resp
 
-    if handler := AFTER_REQUEST_HANDLERS.get((request.path, request.method)):
+    # HEAD is folded onto GET (issue #286). werkzeug dispatches HEAD to the GET view and
+    # then strips the body, but it PRESERVES Content-Length. The handlers registered here
+    # filter search/list responses down to what the caller may see, so a HEAD that skipped
+    # them was served the unfiltered global result set and leaked its exact size — the
+    # existence/size oracle #286 is about. Folding the lookup in before_request alone only
+    # closed the authorization half; without this the response half stayed open.
+    method = "GET" if request.method == "HEAD" else request.method
+    if handler := AFTER_REQUEST_HANDLERS.get((request.path, method)):
         handler(resp)
     return resp

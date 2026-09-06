@@ -296,6 +296,10 @@ class TestSqlAlchemyStore:
             password_expiration=expiration,
             is_admin=True,
             is_service_account=False,
+            active=None,
+            managed_by=None,
+            written_by=None,
+            admin_override=False,
         )
         assert result == mock_user
 

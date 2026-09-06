@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mlflow-oidc-auth"
 dynamic = ["version"]
-description = "OIDC auth plugin for MLflow"
+description = "OpenID Connect (OIDC) auth plugin for MLflow"
 readme = "README.md"
 keywords = ["mlflow", "oauth2", "oidc"]
 license = "Apache-2.0"
@@ -24,7 +24,7 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-  "mlflow<4,>=3.10.0",
+  "mlflow<4,>=3.14.0",
   "python-dotenv<2",
   "requests<3,>=2.32.5",
   "sqlalchemy<3,>=2.0.46",
@@ -95,6 +95,7 @@ oidc-auth = "mlflow_oidc_auth.app:app"
 mlflow_oidc_auth = [
   "db/migrations/alembic.ini",
   "hack/menu.html",
+  "hack/reauth.html",
   "ui/**/*",
 ]
 
