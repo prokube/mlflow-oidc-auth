@@ -6,7 +6,7 @@ WORKDIR /mlflow
 RUN python3 -m venv .venv
 ENV PATH="/mlflow/.venv/bin:$PATH"
 RUN --mount=from=ghcr.io/astral-sh/uv,source=/uv,target=/bin/uv \
-    uv pip install --no-cache-dir /dist/mlflow-*.tar.gz /dist/mlflow_oidc_auth-*.tar.gz \
+    uv pip install --no-cache-dir /dist/mlflow-*.tar.gz /dist/mlflow_oidc_auth-*.whl \
         "boto3>=1.37.34" "azure-storage-blob>=12.25.1" "azure-identity>=1.21.0" "google-cloud-storage>=3.1.0" "psycopg2-binary==2.9.11"
 
 FROM ${BASE_IMAGE} AS final
