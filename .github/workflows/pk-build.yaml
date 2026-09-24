@@ -12,7 +12,10 @@ env:
   # RFC-006: only release-tag builds go to releases; everything else goes to development.
   RELEASE_IMAGE_PUSH_PATH: "europe-west3-docker.pkg.dev/prokube/releases"
   DEV_IMAGE_PUSH_PATH: "europe-west3-docker.pkg.dev/prokube/development"
-  MLFLOW_COMMIT: 8ce990fac54f73fcb57ff557ded1347faea172a2
+  # Must match the upstream tag pk-build is based on; stamped into the wheel metadata.
+  MLFLOW_OIDC_AUTH_VERSION: "7.19.0"
+  # MLflow v3.16.1
+  MLFLOW_COMMIT: 32792afe5b0183fce10532d3a023f5cfa8612d09
 
 jobs:
   build:
@@ -100,6 +103,7 @@ jobs:
           cd ..
           uv sync --no-install-project --no-cache
           uv build
+          test -f "dist/mlflow_oidc_auth-${MLFLOW_OIDC_AUTH_VERSION}-py3-none-any.whl"
 
       - name: Auth GCloud CLI
         uses: google-github-actions/auth@v2
