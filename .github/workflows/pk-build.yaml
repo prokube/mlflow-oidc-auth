@@ -2,14 +2,16 @@ name: Build prokube flavored MLflow OIDC Auth Image
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     tags:
       - 'v*'
 
 env:
   IMAGE_NAME: "mlflow-oidc-auth"
-  IMAGE_PUSH_PATH: "${{ secrets.GCP_ARTIFACT_REGISTRY_PATH }}"
-  DEV_IMAGE_PUSH_PATH: "${{ secrets.GCP_DEV_ARTIFACT_REGISTRY_PATH }}"
+  # RFC-006: only release-tag builds go to releases; everything else goes to development.
+  RELEASE_IMAGE_PUSH_PATH: "europe-west3-docker.pkg.dev/prokube/releases"
+  DEV_IMAGE_PUSH_PATH: "europe-west3-docker.pkg.dev/prokube/development"
   MLFLOW_COMMIT: 8ce990fac54f73fcb57ff557ded1347faea172a2
 
 jobs:
@@ -22,10 +24,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Stop workflow if trigger was tag push which is not on pk-main branch
+      - name: Validate release tag
         id: validate-tag-push
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
+          # vA.B.C_vX.Y.Z: A.B.C is the upstream mlflow-oidc-auth version, X.Y.Z ours
+          if [[ ! "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+_v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+            echo "::error::Release tag must match vA.B.C_vX.Y.Z or vA.B.C_vX.Y.Z-rcN"
+            exit 1
+          fi
           git fetch origin pk-main
           if ! git branch -r --contains HEAD | grep -q 'origin/pk-main'; then
             echo "::error::Tag is not on pk-main branch. Stopping the workflow."
@@ -105,12 +114,13 @@ jobs:
           password: ${{ secrets.GCP_SA_KEY }}
 
       - name: Build and push dev docker image
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         id: docker-build-dev
+        env:
+          BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
           # Build image tag
-          BRANCH_NAME="${{ github.head_ref }}"
           COMMIT_SHORT=$(git rev-parse --short HEAD)
 
           # Sanitize branch name (replace / and other invalid chars with -)
@@ -141,24 +151,15 @@ jobs:
           ${{ steps.docker-build-dev.outputs.commit_tag }}
           \`\`\`"
 
-      - name: Build and push prod docker image if pushed tag is on pk-main branch
+      - name: Build and push release docker image if pushed tag is on pk-main branch
         id: docker-build-prod
-        if: startsWith(github.ref, 'refs/tags/') && steps.validate-tag-push.outcome == 'success'
+        if: github.event_name == 'push' && steps.validate-tag-push.outcome == 'success'
         run: |
           set -euo pipefail
-          TAG=${GITHUB_REF#refs/tags/}
-          COMMIT=$(git rev-list -1 HEAD)
-
-          IMAGE_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${TAG}
-          LATEST_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:latest
-          COMMITS_TAG=${{ env.IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${COMMIT}-${{ env.MLFLOW_COMMIT }}
-
+          # RFC-006: exactly one tag (the git tag) per release image, never latest
+          IMAGE_TAG=${{ env.RELEASE_IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
           docker build --platform linux/amd64 -t $IMAGE_TAG .
-          docker tag $IMAGE_TAG $LATEST_TAG
-          docker tag $IMAGE_TAG $COMMITS_TAG
           docker push $IMAGE_TAG
-          docker push $LATEST_TAG
-          docker push $COMMITS_TAG
 
       - name: Save MLflow build cache
         if: always() && steps.build-mlflow.outcome == 'success'
