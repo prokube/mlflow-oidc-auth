@@ -13,7 +13,7 @@ env:
   RELEASE_IMAGE_PUSH_PATH: "europe-west3-docker.pkg.dev/prokube/releases"
   DEV_IMAGE_PUSH_PATH: "europe-west3-docker.pkg.dev/prokube/development"
   # Must match the upstream tag pk-build is based on; stamped into the wheel metadata.
-  MLFLOW_OIDC_AUTH_VERSION: "7.19.0"
+  MLFLOW_OIDC_AUTH_VERSION: "8.0.0"
   # MLflow v3.16.1
   MLFLOW_COMMIT: 32792afe5b0183fce10532d3a023f5cfa8612d09
 
@@ -129,7 +129,7 @@ jobs:
 
           # Sanitize branch name (replace / and other invalid chars with -)
           BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
-          
+
           # Generate datetime stamp
           DATETIME=$(date -u +%Y%m%d-%H%M%S)
 
