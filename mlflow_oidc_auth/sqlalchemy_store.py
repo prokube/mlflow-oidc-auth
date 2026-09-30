@@ -62,6 +62,7 @@ from mlflow_oidc_auth.repository import (
     GatewayModelDefinitionGroupPermissionRepository,
     GatewayModelDefinitionPermissionGroupRegexRepository,
     UserRepository,
+    UserTokenRepository,
     UserIdentityRepository,
     AuthSessionRepository,
     AuthStateRepository,
@@ -86,6 +87,7 @@ class SqlAlchemyStore:
         SessionMaker = sessionmaker(bind=self.engine)
         self.ManagedSessionMaker = _get_managed_session_maker(SessionMaker, self.db_type)
         self.user_repo = UserRepository(self.ManagedSessionMaker)
+        self.user_token_repo = UserTokenRepository(self.ManagedSessionMaker)
         self.user_identity_repo = UserIdentityRepository(self.ManagedSessionMaker)
         self.auth_session_repo = AuthSessionRepository(self.ManagedSessionMaker, row_locks=self.db_type != "sqlite")
         self.auth_state_repo = AuthStateRepository(self.ManagedSessionMaker)
@@ -188,6 +190,7 @@ class SqlAlchemyStore:
                     time.sleep(sleep_duration)
                 else:
                     raise
+        raise RuntimeError("unreachable: the last engine creation attempt re-raises its error")
 
     def ping(self) -> bool:
         """Lightweight database connectivity check for health probes.
@@ -319,17 +322,40 @@ class SqlAlchemyStore:
         return self.scorer_group_regex_repo.revoke(id=id, group_name=group_name)
 
     def authenticate_user(self, username: str, password: str) -> bool:
-        return self.user_repo.authenticate(username, password)
+        """Whether ``password`` is a live access token of ``username`` (issue #189)."""
+        return self.user_token_repo.authenticate(username, password)
+
+    def create_user_token(self, username: str, name: str, expires_at: datetime, created_by: Optional[str]):
+        """Issue a named access token. Returns ``(record, plaintext)``; the plaintext is not stored."""
+        return self.user_token_repo.create(username, name, expires_at, created_by)
+
+    def replace_user_token(self, username: str, name: str, expires_at: datetime, created_by: Optional[str]):
+        """Issue a token named ``name``, replacing any of that name. Returns ``(record, plaintext, replaced)``."""
+        return self.user_token_repo.replace(username, name, expires_at, created_by)
+
+    def list_user_tokens(self, username: str):
+        """Every access token of ``username``, expired ones included. Records carry no hash."""
+        return self.user_token_repo.list(username)
+
+    def delete_user_token(self, username: str, token_id: int):
+        """Delete one access token of ``username``. Returns the deleted record."""
+        return self.user_token_repo.delete(username, token_id)
+
+    def delete_user_tokens(self, username: str) -> int:
+        """Delete every access token of ``username``. Returns how many were deleted."""
+        return self.user_token_repo.delete_all(username)
 
     def create_user(
         self,
         username: str,
-        password: str,
         display_name: str,
         is_admin: bool = False,
         is_service_account=False,
+        *,
+        written_by: Optional[str] = None,
     ):
-        return self.user_repo.create(username, password, display_name, is_admin, is_service_account)
+        """Create a ``manual`` user row. Refused, and never re-owned, if the username exists (#360)."""
+        return self.user_repo.create(username, display_name, is_admin, is_service_account, written_by=written_by)
 
     def create_auth_session(self, username: str, expires_at, provider_id: Optional[str] = None, encrypted_tokens: Optional[str] = None) -> str:
         """Open a server-side session and return its opaque id (issue #310).
@@ -369,6 +395,14 @@ class SqlAlchemyStore:
         """Revoke every live session for a user. Returns how many were revoked."""
         return self.auth_session_repo.revoke_all_for_user(username)
 
+    def list_live_auth_session_details(self, username: str):
+        """A user's live sessions for administration (#325). Never carries a full session id."""
+        return self.auth_session_repo.list_live_details_for_user(username)
+
+    def revoke_auth_session_by_pk(self, username: str, session_pk: int) -> bool:
+        """Revoke one of ``username``'s sessions by row id. False if it is not a live session of theirs."""
+        return self.auth_session_repo.revoke_by_pk_for_user(username, session_pk)
+
     def list_live_auth_sessions_for_provider(self, username: str, provider_id: str):
         """``(session_id, encrypted_tokens)`` for a user's live sessions opened by one provider (#329)."""
         return self.auth_session_repo.list_live_for_provider(username, provider_id)
@@ -400,6 +434,17 @@ class SqlAlchemyStore:
 
         return self.user_repo.get_profile(username)
 
+    def provision_workload_identity(
+        self,
+        username: str,
+        display_name: str,
+        provider_id: str,
+        subject: str,
+        managed_by: str,
+    ) -> User:
+        """Atomically provision a workload user without creating a local bearer secret."""
+        return self.user_repo.provision_workload_identity(username, display_name, provider_id, subject, managed_by)
+
     def list_users(self, is_service_account: bool = False, all: bool = False) -> List[User]:
         return self.user_repo.list(is_service_account, all)
 
@@ -410,39 +455,28 @@ class SqlAlchemyStore:
     def update_user(
         self,
         username: str,
-        password: Optional[str] = None,
-        password_expiration: Optional[datetime] = None,
         is_admin: Optional[bool] = None,
         is_service_account: Optional[bool] = None,
         active: Optional[bool] = None,
         managed_by: Optional[str] = None,
         written_by: Optional[str] = None,
         admin_override: bool = False,
+        revoke_tokens: bool = False,
     ) -> User:
         """Update the supplied fields of a user, leaving omitted ones untouched.
 
-        ``None`` means "not supplied" for every parameter but one: the corresponding column is
-        left as it is.
-
-        The exception is ``password_expiration``, because expiry is a property of the *secret*
-        rather than of the user. **Supplying a ``password`` also replaces the expiration** with
-        exactly the value passed in, and ``None`` there means "does not expire" rather than
-        "leave it alone" — a rotated secret never inherits the previous one's lifetime. When no
-        ``password`` is supplied, the expiry changes only if one was passed.
-
-        The practical consequence, which the signature alone does not convey: calling
-        ``update_user(username=u, password=new_secret)`` on a user whose token currently expires
-        will leave them with one that never expires. Pass the expiration explicitly to keep one.
-
-        See :meth:`mlflow_oidc_auth.repository.user.UserRepository.update` for the reasoning
-        (issue #338).
+        ``None`` means "not supplied": the corresponding column is left as it is. See
+        :meth:`mlflow_oidc_auth.repository.user.UserRepository.update` (issue #338).
 
         Parameters:
             username: Identity key of the user to update.
-            password: New secret. Also resets the expiration, per above.
-            password_expiration: Expiry for the stored secret. See the semantics above.
             is_admin: New administrator flag.
             is_service_account: New service-account flag.
+            active: Whether the account may authenticate.
+            managed_by: Which source owns this row.
+            written_by: Which source is performing this write, for the ownership guard.
+            admin_override: Break glass for a row another source owns.
+            revoke_tokens: Delete every access token of the user in the same transaction.
 
         Returns:
             User: The updated user entity.
@@ -452,18 +486,18 @@ class SqlAlchemyStore:
         """
         return self.user_repo.update(
             username=username,
-            password=password,
-            password_expiration=password_expiration,
             is_admin=is_admin,
             is_service_account=is_service_account,
             active=active,
             managed_by=managed_by,
             written_by=written_by,
             admin_override=admin_override,
+            revoke_tokens=revoke_tokens,
         )
 
-    def delete_user(self, username: str):
-        return self.user_repo.delete(username)
+    def delete_user(self, username: str, *, written_by: Optional[str] = None, admin_override: bool = False, actor: Optional[str] = None):
+        """Hard-delete a user through the ownership guard (#360). See :meth:`UserRepository.delete`."""
+        return self.user_repo.delete(username, written_by=written_by, admin_override=admin_override, actor=actor)
 
     def create_experiment_permission(self, experiment_id: str, username: str, permission: str) -> ExperimentPermission:
         return self.experiment_repo.grant_permission(experiment_id, username, permission)
@@ -522,8 +556,13 @@ class SqlAlchemyStore:
     def list_experiment_permissions_for_experiment(self, experiment_id: str) -> List[ExperimentPermission]:
         return self.experiment_repo.list_permissions_for_experiment(experiment_id)
 
-    def populate_groups(self, group_names: List[str]):
-        return self.group_repo.create_groups(group_names)
+    def populate_groups(self, group_names: List[str], written_by: Optional[str] = None) -> List[str]:
+        """Create the missing groups, owned by ``written_by`` (default ``manual``).
+
+        Returns the subset of ``group_names`` this call actually inserted; see
+        :meth:`GroupRepository.create_groups`.
+        """
+        return self.group_repo.create_groups(group_names, written_by=written_by)
 
     def get_groups(self) -> List[str]:
         return self.group_repo.list_groups()
@@ -531,11 +570,13 @@ class SqlAlchemyStore:
     def get_group_users(self, group_name: str) -> List[User]:
         return self.group_repo.list_group_members(group_name)
 
-    def add_user_to_group(self, username: str, group_name: str) -> None:
-        return self.group_repo.add_user_to_group(username, group_name)
+    def add_user_to_group(self, username: str, group_name: str, **kwargs) -> None:
+        """Add one membership, owned by ``written_by`` (default ``manual``)."""
+        return self.group_repo.add_user_to_group(username, group_name, **kwargs)
 
-    def remove_user_from_group(self, username: str, group_name: str) -> None:
-        return self.group_repo.remove_user_from_group(username, group_name)
+    def remove_user_from_group(self, username: str, group_name: str, **kwargs) -> None:
+        """Remove one membership through the ownership guard (``written_by``, ``admin_override``, ``actor``)."""
+        return self.group_repo.remove_user_from_group(username, group_name, **kwargs)
 
     def get_groups_for_user(self, username: str) -> List[str]:
         return self.group_repo.list_groups_for_user(username)
@@ -543,8 +584,21 @@ class SqlAlchemyStore:
     def get_groups_ids_for_user(self, username: str) -> List[int]:
         return self.group_repo.list_group_ids_for_user(username)
 
-    def set_user_groups(self, username: str, group_names: List[str]) -> None:
-        return self.group_repo.set_groups_for_user(username, group_names)
+    def set_user_groups(
+        self,
+        username: str,
+        group_names: List[str],
+        *,
+        written_by: Optional[str] = None,
+        admin_override: bool = False,
+        actor: Optional[str] = None,
+    ):
+        """Sync a user's membership as ``written_by`` sees it, through the ownership guard (#360).
+
+        See :meth:`GroupRepository.set_groups_for_user` for which memberships are added, kept and
+        removed.
+        """
+        return self.group_repo.set_groups_for_user(username, group_names, written_by=written_by, admin_override=admin_override, actor=actor)
 
     def get_group_experiments(self, group_name: str) -> List[ExperimentPermission]:
         return self.experiment_group_repo.list_permissions_for_group(group_name)
@@ -1192,6 +1246,32 @@ class SqlAlchemyStore:
         """Return the live SCIM token record for ``plaintext``, or None."""
         return self._scim_token_repo().authenticate(plaintext)
 
+    def _scim_activity_repo(self):
+        """The SCIM activity repository (#325), created on first use like the token repository."""
+        repo = getattr(self, "_scim_activity_repository", None)
+        if repo is None:
+            from mlflow_oidc_auth.repository.scim_activity import ScimActivityRepository
+
+            repo = ScimActivityRepository(self.ManagedSessionMaker)
+            self._scim_activity_repository = repo
+        return repo
+
+    def record_scim_activity(self, **fields) -> None:
+        """Record one ``/scim/v2`` request. See ``ScimActivityRepository.record``."""
+        self._scim_activity_repo().record(**fields)
+
+    def list_scim_activity(self, limit: int = 50, before: Optional[int] = None, outcome: Optional[str] = None, token_id: Optional[int] = None):
+        """Recorded SCIM requests, newest first."""
+        return self._scim_activity_repo().list(limit=limit, before=before, outcome=outcome, token_id=token_id)
+
+    def scim_provisioning_status(self, healthy_window_seconds: int):
+        """Provisioning health, overall and per token."""
+        return self._scim_activity_repo().status(healthy_window_seconds)
+
+    def delete_scim_activity_before(self, cutoff: datetime) -> int:
+        """Sweep SCIM activity recorded before ``cutoff``. Returns the count."""
+        return self._scim_activity_repo().delete_older_than(cutoff)
+
     @staticmethod
     def _user_detail(row) -> dict:
         return {
@@ -1272,9 +1352,9 @@ class SqlAlchemyStore:
         """Create a directory-provisioned user in one transaction.
 
         The row is born ``managed_by='scim'``, never an administrator and never a service
-        account: a directory decides who exists, not who is privileged. Its basic-auth secret is
-        a fresh random value that nobody is told — the user signs in through their IdP, or is
-        issued a token later through the normal self-service path.
+        account: a directory decides who exists, not who is privileged. It holds no access token —
+        the user signs in through their IdP, or is issued a token later through the normal
+        self-service path.
 
         Raises:
             MlflowException: ``RESOURCE_ALREADY_EXISTS`` if the username or external id is taken.
@@ -1283,11 +1363,9 @@ class SqlAlchemyStore:
         from mlflow.protos.databricks_pb2 import RESOURCE_ALREADY_EXISTS
         from mlflow.utils.validation import _validate_username
         from sqlalchemy.exc import IntegrityError
-        from werkzeug.security import generate_password_hash
 
         from mlflow_oidc_auth.db.models import SqlUser
-        from mlflow_oidc_auth.repository.user import TOKEN_HASH_METHOD, normalize_username
-        from mlflow_oidc_auth.user import generate_token
+        from mlflow_oidc_auth.repository.user import normalize_username
 
         username = normalize_username(username)
         _validate_username(username)
@@ -1295,7 +1373,6 @@ class SqlAlchemyStore:
             row = SqlUser(
                 username=username,
                 display_name=display_name or username,
-                password_hash=generate_password_hash(generate_token(), method=TOKEN_HASH_METHOD),
                 is_admin=False,
                 is_service_account=False,
                 active=bool(active),
@@ -1333,15 +1410,12 @@ class SqlAlchemyStore:
             external_id: New external id (None clears) — only written when ``set_external_id``.
             set_external_id: Whether ``external_id`` was supplied at all.
             claim: Mark the row ``managed_by='scim'``. Provisioning only: the caller decides.
-            revoke_credential: Replace the basic-auth secret with an undisclosed, expired one.
+            revoke_credential: Delete every access token of the user.
 
         Returns:
             The user as a plain dict (see :meth:`list_user_details`).
         """
-        from datetime import timezone
-
         from mlflow_oidc_auth.repository.user import UNSET
-        from mlflow_oidc_auth.user import generate_token
 
         kwargs = {"written_by": "scim", "active": active, "display_name": display_name}
         if set_external_id:
@@ -1351,18 +1425,65 @@ class SqlAlchemyStore:
         if claim:
             kwargs["managed_by"] = "scim"
         if revoke_credential:
-            kwargs["password"] = generate_token()
-            kwargs["password_expiration"] = datetime.now(timezone.utc)
+            kwargs["revoke_tokens"] = True
         self.user_repo.update(username, **kwargs)
         return self.get_user_detail(username)
 
-    def delete_user_with_hook(self, username: str, before_cascade, after_cascade=None) -> None:
+    def delete_user_with_hook(
+        self,
+        username: str,
+        before_cascade,
+        after_cascade=None,
+        *,
+        written_by: Optional[str] = None,
+        admin_override: bool = False,
+        actor: Optional[str] = None,
+    ) -> None:
         """Hard-delete a user, running ``before_cascade(session, user)`` and ``after_cascade(session)``
         inside the same transaction, before and after the cascade.
 
-        See :func:`mlflow_oidc_auth.orphans.delete_user_reporting_orphans`.
+        The ownership guard (#360) runs first; see :meth:`UserRepository.delete`. See also
+        :func:`mlflow_oidc_auth.orphans.delete_user_reporting_orphans`.
         """
-        return self.user_repo.delete(username, before_cascade=before_cascade, after_cascade=after_cascade)
+        return self.user_repo.delete(
+            username,
+            before_cascade=before_cascade,
+            after_cascade=after_cascade,
+            written_by=written_by,
+            admin_override=admin_override,
+            actor=actor,
+        )
+
+    def set_membership_owner(self, username: str, managed_by: str):
+        """Hand every membership of a user to ``managed_by`` (break glass, #360)."""
+        return self.group_repo.set_membership_owner(username, managed_by)
+
+    def hand_over_user(self, username: str, managed_by: str, *, memberships: bool = False, actor: Optional[str] = None) -> dict:
+        """Hand a user row, and optionally its memberships, to ``managed_by`` in one transaction."""
+        return self.user_repo.hand_over(username, managed_by, memberships=memberships, actor=actor)
+
+    # SCIM /Groups (#323). Group-centric writes change many users' membership at once, so the
+    # wiring at the bottom of this module flushes both permission caches after each of them.
+
+    def list_group_details_page(self, **kwargs):
+        """A page of groups with their members. See :meth:`GroupRepository.list_group_details_page`."""
+        return self.group_repo.list_group_details_page(**kwargs)
+
+    def get_group_detail(self, group_name: str, **kwargs) -> Optional[dict]:
+        """One group with its members, or None."""
+        return self.group_repo.get_group_detail(group_name, **kwargs)
+
+    def create_directory_group(self, group_name: str, external_id: Optional[str], members, *, written_by: str) -> dict:
+        """Create a group and its members, owned by ``written_by``, in one transaction."""
+        return self.group_repo.create_directory_group(group_name, external_id, members, written_by=written_by)
+
+    def apply_group_changes(self, group_name: str, operations, **kwargs):
+        """Apply a directory change set to one group. See :meth:`GroupRepository.apply_group_changes`."""
+        return self.group_repo.apply_group_changes(group_name, operations, **kwargs)
+
+    def delete_directory_group(self, group_name: str, **kwargs):
+        """Delete a group, its memberships and its grants through the guard."""
+        return self.group_repo.delete_directory_group(group_name, **kwargs)
 
     def list_group_details(self) -> List[dict]:
         """Every group with its external id and member count, in two column-only statements.
@@ -1559,6 +1680,16 @@ _MEMBERSHIP_CUD_METHODS = [
     "remove_user_from_group",
 ]
 
+# Group-centric membership writes (SCIM /Groups, #323). One call changes the membership of any
+# number of users — and a group delete drops the group's grants — so there is no single user to
+# target: both the permission cache and the workspace cache are flushed. These are directory
+# syncs, not per-login writes, so the full flush is affordable.
+_GROUP_CUD_METHODS = [
+    "create_directory_group",
+    "apply_group_changes",
+    "delete_directory_group",
+]
+
 # Group-scoped workspace permission CUD. Invalidation lives here rather than only in
 # the router so it cannot be bypassed by any other caller of the store. All three take
 # (workspace, group_name) as their first two positional arguments.
@@ -1733,3 +1864,7 @@ def _wrap_with_workspace_flush(method):
 for _method_name in _WORKSPACE_WIPE_METHODS:
     _original = getattr(SqlAlchemyStore, _method_name)
     setattr(SqlAlchemyStore, _method_name, _wrap_with_workspace_flush(_original))
+
+for _method_name in _GROUP_CUD_METHODS:
+    _original = getattr(SqlAlchemyStore, _method_name)
+    setattr(SqlAlchemyStore, _method_name, _wrap_with_workspace_flush(_wrap_with_cache_flush(_original)))

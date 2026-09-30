@@ -11,6 +11,7 @@ own projected token becomes an MLflow user. The namespace allowlist is the whole
 these cases pin it.
 """
 
+import importlib
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -165,7 +166,7 @@ class TestProvisioningAServiceAccount:
         assert create_user.call_args.kwargs["username"] == "trainer.team-a@serviceaccount.cluster.local"
         assert create_user.call_args.kwargs["is_service_account"] is True
         assert create_user.call_args.kwargs["is_admin"] is False
-        populate_groups.assert_called_once_with(group_names=["k8s:team-a"])
+        populate_groups.assert_called_once_with(group_names=["k8s:team-a"], written_by="oidc:cluster")
 
     def test_the_oidc_provisioning_flag_is_not_a_hidden_prerequisite(self):
         """OIDC_PROVISION_ON_BEARER_AUTH gates provisioning from an *OIDC* token, where the
@@ -255,7 +256,7 @@ class TestProvisioningAServiceAccount:
         events = []
         payload = {"sub": "system:serviceaccount:kube-system:default"}
 
-        import mlflow_oidc_auth.middleware.auth_middleware as middleware_module
+        middleware_module = importlib.import_module("mlflow_oidc_auth.middleware.auth_middleware")
 
         middleware_module._denial_audit_seen.clear()
         with patch("mlflow_oidc_auth.middleware.auth_middleware.emit_audit_event", lambda event, **kw: events.append((event, kw))):
@@ -439,7 +440,7 @@ class TestTokensWithoutAnExpiry:
         assert verify_with()(cluster.mint(sub=self.SUBJECT))["sub"] == self.SUBJECT
 
     def test_a_token_without_an_expiry_is_refused_by_default(self, verify_with, cluster):
-        from authlib.jose.errors import MissingClaimError
+        from joserfc.errors import MissingClaimError
 
         with pytest.raises(MissingClaimError):
             verify_with()(self._without_exp(cluster))

@@ -7,6 +7,8 @@ from mlflow.protos.model_registry_pb2 import (
     SearchModelVersions,
     SearchRegisteredModels,
 )
+from mlflow.protos.mlflow_artifacts_pb2 import ListArtifacts as ListArtifactsMlflowArtifacts
+from mlflow.protos.review_queues_pb2 import ListReviewQueues
 from mlflow.protos.service_pb2 import (
     CreateExperiment,
     CreateGatewayEndpoint,
@@ -21,13 +23,16 @@ from mlflow.protos.service_pb2 import (
     ListGatewayEndpoints,
     ListGatewayModelDefinitions,
     ListGatewaySecretInfos,
+    ListScorers,
     ListWorkspaces,
     RegisterScorer,
+    SearchEvaluationDatasets,
     SearchExperiments,
     SearchLoggedModels,
     UpdateGatewayEndpoint,
 )
 from mlflow.server.handlers import (
+    _get_ajax_path,
     _get_model_registry_store,
     _get_request_message,
     _get_tracking_store,
@@ -35,6 +40,7 @@ from mlflow.server.handlers import (
     get_endpoints,
 )
 from mlflow.utils.proto_json_utils import message_to_json, parse_dict
+from mlflow.entities.lifecycle_stage import LifecycleStage
 from mlflow.utils.search_utils import SearchUtils
 
 import json
@@ -42,12 +48,15 @@ import json
 from mlflow_oidc_auth.bridge import get_fastapi_admin_status, get_fastapi_username
 from mlflow_oidc_auth.bridge.user import get_auth_context
 from mlflow_oidc_auth.config import config
+from mlflow_oidc_auth.hooks.http_method import authorization_method
 from mlflow_oidc_auth.logger import get_logger
 from mlflow_oidc_auth.permissions import MANAGE
 from mlflow_oidc_auth.store import store
 from mlflow_oidc_auth.utils import (
     can_read_experiment,
     can_read_registered_model,
+    effective_scorer_permission,
+    get_experiment_ids,
     get_model_name,
 )
 from mlflow_oidc_auth.utils.permissions import (
@@ -55,6 +64,9 @@ from mlflow_oidc_auth.utils.permissions import (
     can_read_gateway_model_definition,
     can_read_gateway_secret,
 )
+from mlflow_oidc_auth.validators._experiment_scope import permission_on_all_experiments
+from mlflow_oidc_auth.validators.experiment import get_active_artifact_experiments, is_artifact_root_listing
+from mlflow_oidc_auth.validators.review import is_review_queue_member
 from mlflow_oidc_auth.utils.workspace_cache import (
     flush_workspace_cache,
     get_workspace_permission_cached,
@@ -605,6 +617,51 @@ def _set_can_manage_gateway_model_definition_permission(resp: Response):
     store.create_gateway_model_definition_permission(name, username, MANAGE.name)
 
 
+# Permission kinds that come from a grant on the scorer itself (user, group, regex or
+# group-regex), as opposed to the default or workspace fallback.
+_NON_EXPLICIT_PERMISSION_KINDS = frozenset({"fallback", "workspace", "workspace-deny"})
+
+
+def _can_read_listed_scorer(experiment_id: str, scorer_name: str, username: str) -> bool:
+    """Whether a ``ListScorers`` row is visible to ``username``.
+
+    READ on the scorer's experiment is always required. A grant on the scorer itself then
+    decides: READ or better keeps the row, ``NO_PERMISSIONS`` hides it. A scorer with no grant
+    of its own follows its experiment. Any lookup error hides the row.
+    """
+    try:
+        if not _cached_can_read_experiment(experiment_id, username):
+            return False
+        result = effective_scorer_permission(experiment_id=experiment_id, scorer_name=scorer_name, user=username)
+        if result.kind in _NON_EXPLICIT_PERMISSION_KINDS:
+            return True
+        return bool(result.permission.can_read)
+    except Exception:
+        get_logger().debug("Scorer permission lookup failed while filtering ListScorers")
+        return False
+
+
+def _filter_list_scorers(resp: Response) -> None:
+    """Remove the scorers the caller cannot read from a ``ListScorers`` response.
+
+    Applies to both forms of the request: with an ``experiment_id`` (already gated on READ
+    for that experiment, so this removes scorers hidden by a ``NO_PERMISSIONS`` grant on the
+    scorer) and without one, where MLflow lists the scorers of every active experiment.
+    """
+    if get_fastapi_admin_status():
+        return
+
+    response_message = ListScorers.Response()  # type: ignore
+    parse_dict(resp.json, response_message)
+    username = get_fastapi_username()
+
+    for scorer in list(response_message.scorers):
+        if not _can_read_listed_scorer(str(scorer.experiment_id), scorer.scorer_name, username):
+            response_message.scorers.remove(scorer)
+
+    resp.data = message_to_json(response_message)
+
+
 def _filter_list_gateway_endpoints(resp: Response) -> None:
     """Filter out gateway endpoints the user cannot read."""
     if get_fastapi_admin_status():
@@ -758,6 +815,157 @@ def _filter_list_workspaces(response: Response) -> None:
     response.set_data(json.dumps(data))
 
 
+def _filter_search_evaluation_datasets(resp: Response) -> None:
+    """Drop evaluation datasets linked to any experiment the caller cannot read.
+
+    ``before_request`` already requires READ on every experiment the search is scoped to, but
+    a dataset can be linked to more experiments than the one it was found through. Reading
+    it by id requires READ on all of them, so the search shows exactly the datasets a
+    ``GET datasets/<id>`` would serve. A dataset linked to no experiment is admin-only.
+    """
+    if get_fastapi_admin_status():
+        return
+    data = resp.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("datasets"), list):
+        return
+    from mlflow_oidc_auth.validators.dataset import dataset_experiment_ids
+
+    username = get_fastapi_username()
+
+    def _readable(dataset: Any) -> bool:
+        if not isinstance(dataset, dict) or not dataset.get("dataset_id"):
+            return False
+        # MLflow serializes a dataset's links only when they were loaded, which a search
+        # does not do, so resolve them from the store.
+        experiment_ids = dataset_experiment_ids(str(dataset["dataset_id"]))
+        return bool(experiment_ids) and all(_cached_can_read_experiment(e, username) for e in experiment_ids)
+
+    data["datasets"] = [d for d in data["datasets"] if _readable(d)]
+    resp.set_data(json.dumps(data))
+
+
+def _filter_list_artifact_root(resp: Response) -> None:
+    """Trim an artifact-ROOT listing to the experiments the caller can READ (issue #289).
+
+    ``GET /mlflow-artifacts/artifacts`` with no ``path`` (or ``.``, ``%2e``, ``./``,
+    ``workspaces/<ws>`` ...) lists the artifact root, which holds one directory per
+    experiment across every tenant. It used to be served whole, enumerating every
+    experiment id. Listing the root is legitimate, so rather than deny it outright the
+    listing keeps only entries that:
+
+    * name, in canonical form, an experiment that exists and is ACTIVE (the same
+      canonical-id and exact-match rules as the path check, fetched in one batched store
+      lookup) — a stray directory, a ``0<id>`` alias, a garbage-collected experiment's
+      leftovers and a soft-deleted experiment are not browsable from the root,
+    * the caller can READ, and
+    * with workspaces enabled, belongs to the workspace being listed — the one a
+      ``workspaces/<ws>`` path names, otherwise the request workspace — and one the
+      caller can read, mirroring the search filters.
+
+    A listing that is not of a root (``path=12/run/artifacts``) is left alone: its
+    entries are file names, and ``before_request`` has already required READ on it.
+    """
+    if get_fastapi_admin_status():
+        return
+    roots = is_artifact_root_listing()
+    if roots is None:
+        return
+    data = resp.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+        return
+
+    username = get_fastapi_username()
+    workspaces_enabled = bool(config.MLFLOW_ENABLE_WORKSPACES)
+    allowed_workspaces: set = set()
+    if workspaces_enabled:
+        from mlflow.utils.workspace_utils import DEFAULT_WORKSPACE_NAME
+
+        from mlflow_oidc_auth.bridge.user import get_request_workspace
+
+        request_workspace = get_request_workspace() or DEFAULT_WORKSPACE_NAME
+        allowed_workspaces = {workspace or request_workspace for workspace in roots}
+
+    # One batched store lookup for every candidate, not one per listed directory.
+    names = [entry.get("path") if isinstance(entry, dict) else None for entry in data["files"]]
+    active = get_active_artifact_experiments(name for name in names if isinstance(name, str))
+
+    def _visible(entry: Any) -> bool:
+        name = entry.get("path") if isinstance(entry, dict) else None
+        experiment = active.get(name) if isinstance(name, str) else None
+        if experiment is None or getattr(experiment, "lifecycle_stage", None) != LifecycleStage.ACTIVE:
+            return False
+        if not _cached_can_read_experiment(name, username):
+            return False
+        if workspaces_enabled:
+            from mlflow.utils.workspace_utils import DEFAULT_WORKSPACE_NAME
+
+            workspace = getattr(experiment, "workspace", None) or DEFAULT_WORKSPACE_NAME
+            if workspace not in allowed_workspaces or not _can_access_workspace(username, workspace):
+                return False
+        return True
+
+    data["files"] = [entry for entry in data["files"] if _visible(entry)]
+    resp.set_data(json.dumps(data))
+
+
+def _redact_gateway_secrets_config(resp: Response) -> None:
+    """Reduce the gateway secrets-config response to what a non-admin needs (issue #366).
+
+    MLflow's handler returns two server-wide flags and no per-secret data::
+
+        {"secrets_available": true, "using_default_passphrase": <bool>}
+
+    ``secrets_available`` gates MLflow's gateway page: when it is not true the page shows
+    only its setup guide, so it must pass through or the page stays blank.
+    ``using_default_passphrase`` says whether stored gateway secrets are encrypted under
+    MLflow's well-known default KEK passphrase. MLflow's UI never reads it, and to anyone
+    other than an operator it is a statement of how weakly the secrets are protected, so
+    it is removed. Admins receive the response unchanged.
+
+    There is nothing per-secret to filter here: which secrets a user can see is decided by
+    ``ListGatewaySecretInfos`` (``_filter_list_gateway_secrets``) and ``GetGatewaySecretInfo``.
+    A body that is not a JSON object is replaced with ``secrets_available: false`` rather
+    than passed through.
+    """
+    if get_fastapi_admin_status():
+        return
+    data = resp.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    # Rebuilt from an allowlist, not stripped by denylist: a field a future MLflow release
+    # adds is withheld from non-admins until it has been reviewed here.
+    resp.set_data(json.dumps({"secrets_available": data.get("secrets_available") is True}))
+
+
+def _filter_list_review_queues(resp: Response) -> None:
+    """Narrow a ``ListReviewQueues`` response to the queues the caller may see.
+
+    Admins and callers with EDIT (or MANAGE) on the experiment see every queue; opening
+    one is gated separately in before_request. Anyone else, who holds READ, sees only the
+    queues they are assigned to. Matches MLflow's own auth plugin.
+
+    Parameters:
+        resp: The response from MLflow's ``ListReviewQueues`` handler.
+    """
+    if get_fastapi_admin_status():
+        return
+
+    username = get_fastapi_username()
+    # before_request already required READ on every experiment the request names.
+    if permission_on_all_experiments(get_experiment_ids(), username).can_update:
+        return
+
+    response_message = ListReviewQueues.Response()  # type: ignore
+    parse_dict(resp.json, response_message)
+    visible = [queue for queue in response_message.review_queues if is_review_queue_member(queue, username)]
+    response_message.ClearField("review_queues")
+    response_message.review_queues.extend(visible)
+    resp.data = message_to_json(response_message)
+
+
+GATEWAY_SECRETS_CONFIG_PATH = _get_ajax_path("/mlflow/gateway/secrets/config", version=3)
+
+
 AFTER_REQUEST_PATH_HANDLERS = {
     CreateExperiment: _set_can_manage_experiment_permission,
     CreateRegisteredModel: _set_can_manage_registered_model_permission,
@@ -769,6 +977,7 @@ AFTER_REQUEST_PATH_HANDLERS = {
     RenameRegisteredModel: _rename_registered_model_permission,
     RegisterScorer: _set_can_manage_scorer_permission,
     DeleteScorer: _delete_scorer_permissions_cascade,
+    ListScorers: _filter_list_scorers,
     CreateGatewayEndpoint: _set_can_manage_gateway_endpoint_permission,
     CreateGatewaySecret: _set_can_manage_gateway_secret_permission,
     CreateGatewayModelDefinition: _set_can_manage_gateway_model_definition_permission,
@@ -780,6 +989,9 @@ AFTER_REQUEST_PATH_HANDLERS = {
     ListGatewaySecretInfos: _filter_list_gateway_secrets,
     ListGatewayModelDefinitions: _filter_list_gateway_model_definitions,
     ListWorkspaces: _filter_list_workspaces,
+    SearchEvaluationDatasets: _filter_search_evaluation_datasets,
+    ListArtifactsMlflowArtifacts: _filter_list_artifact_root,
+    ListReviewQueues: _filter_list_review_queues,
     CreateWorkspace: _auto_grant_workspace_manage_permission,
     DeleteWorkspace: _cascade_delete_workspace_permissions,
 }
@@ -809,6 +1021,8 @@ AFTER_REQUEST_HANDLERS = {
     for method in methods
     if handler in _our_handlers and "/graphql" not in http_path
 }
+# Non-proto Flask route, so get_endpoints() above cannot map it; bound by exact path.
+AFTER_REQUEST_HANDLERS[(GATEWAY_SECRETS_CONFIG_PATH, "GET")] = _redact_gateway_secrets_config
 
 
 @catch_mlflow_exception
@@ -822,7 +1036,7 @@ def after_request_hook(resp: Response):
     # them was served the unfiltered global result set and leaked its exact size — the
     # existence/size oracle #286 is about. Folding the lookup in before_request alone only
     # closed the authorization half; without this the response half stayed open.
-    method = "GET" if request.method == "HEAD" else request.method
+    method = authorization_method(request.method)
     if handler := AFTER_REQUEST_HANDLERS.get((request.path, method)):
         handler(resp)
     return resp

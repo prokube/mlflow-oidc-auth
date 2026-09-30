@@ -675,22 +675,119 @@ class TestATokenProviderMustPinItsOwnIssuerAndKeys:
 
 
 class TestTwoProvidersCannotClaimOneIssuer:
-    """Validation takes the first exact ``iss`` match, so a duplicate means the second entry's
-    policy — its audience, binding and group rules — is silently never applied."""
+    """A duplicate issuer is ambiguous, so neither policy may remain active."""
 
-    def test_the_later_entry_is_rejected(self):
+    def test_every_entry_with_the_duplicate_issuer_is_rejected(self):
         first = valid_entry(id="first", issuer="https://shared.example.com")
         second = valid_entry(id="second", issuer="https://shared.example.com")
 
         result = build([first, second])
 
-        assert [provider.id for provider in result.providers] == ["first"]
-        assert any("already claimed" in error for error in result.errors)
+        assert result.providers == []
+        assert any("every provider using it is ignored" in error for error in result.errors)
 
     def test_distinct_issuers_both_survive(self):
         result = build([valid_entry(id="first"), valid_entry(id="second")])
 
         assert [provider.id for provider in result.providers] == ["first", "second"]
+
+
+class TestPublicClient:
+    """``public_client`` registers an OIDC client without a secret (#300). Opt-in, strict about its
+    type, and refused on a provider type that has no OAuth client to register."""
+
+    def test_it_defaults_to_false(self):
+        assert build([valid_entry()]).providers[0].public_client is False
+        assert ProviderConfig(id="bare").public_client is False
+
+    def test_an_oidc_provider_may_opt_in(self):
+        result = build([valid_entry(public_client=True)])
+
+        assert result.errors == []
+        assert result.providers[0].public_client is True
+
+    def test_false_is_accepted_explicitly(self):
+        assert build([valid_entry(public_client=False)]).providers[0].public_client is False
+
+    @pytest.mark.parametrize("bad_value", ["true", "false", 1, 0, None, [], {}])
+    def test_a_non_boolean_is_refused(self, bad_value):
+        """``"false"`` is truthy; reading it as true would register a client without its secret."""
+        result = build([valid_entry(public_client=bad_value)])
+
+        assert result.providers == []
+        assert any("'public_client' must be true or false" in error for error in result.errors)
+
+    def test_it_is_refused_on_a_k8s_provider(self):
+        result = build([valid_entry(type="k8s", in_cluster=True, public_client=True)])
+
+        assert result.providers == []
+        assert any("'public_client' applies only to an 'oidc' provider" in error for error in result.errors)
+
+    def test_it_is_refused_on_a_saml_provider(self, monkeypatch):
+        from mlflow_oidc_auth import provider_registry as registry_module
+
+        monkeypatch.setattr(registry_module, "_saml_extra_installed", lambda: True)
+
+        result = build([saml_entry(public_client=True)])
+
+        assert result.providers == []
+        assert any("'public_client' applies only to an 'oidc' provider" in error for error in result.errors)
+
+    def test_the_legacy_provider_takes_it_from_oidc_public_client(self):
+        assert build(app_config=legacy_app_config(OIDC_PUBLIC_CLIENT=True)).providers[0].public_client is True
+        assert build(app_config=legacy_app_config(OIDC_PUBLIC_CLIENT=False)).providers[0].public_client is False
+        # Absent (an AppConfig from before the setting existed) and anything but a real boolean: off.
+        assert build(app_config=legacy_app_config()).providers[0].public_client is False
+        assert build(app_config=legacy_app_config(OIDC_PUBLIC_CLIENT="true")).providers[0].public_client is False
+
+
+class TestUserinfoGroups:
+    """``userinfo_groups`` lets UserInfo supply the groups and workspace claims. Opt-in, strict
+    about its type, and refused on a provider type that has no UserInfo endpoint."""
+
+    def test_it_defaults_to_false(self):
+        assert build([valid_entry()]).providers[0].userinfo_groups is False
+        assert ProviderConfig(id="bare").userinfo_groups is False
+
+    def test_an_oidc_provider_may_opt_in(self):
+        result = build([valid_entry(userinfo_groups=True)])
+
+        assert result.errors == []
+        assert result.providers[0].userinfo_groups is True
+
+    def test_false_is_accepted_explicitly(self):
+        assert build([valid_entry(userinfo_groups=False)]).providers[0].userinfo_groups is False
+
+    @pytest.mark.parametrize("bad_value", ["true", "false", 1, 0, None, [], {}])
+    def test_a_non_boolean_is_refused(self, bad_value):
+        """``"false"`` is truthy; reading it as true would let UserInfo decide group membership."""
+        result = build([valid_entry(userinfo_groups=bad_value)])
+
+        assert result.providers == []
+        assert any("'userinfo_groups' must be true or false" in error for error in result.errors)
+
+    def test_it_is_refused_on_a_k8s_provider(self):
+        result = build([valid_entry(type="k8s", in_cluster=True, userinfo_groups=True)])
+
+        assert result.providers == []
+        assert any("'userinfo_groups' applies only to an 'oidc' provider" in error for error in result.errors)
+
+    def test_it_is_refused_on_a_saml_provider(self, monkeypatch):
+        from mlflow_oidc_auth import provider_registry as registry_module
+
+        monkeypatch.setattr(registry_module, "_saml_extra_installed", lambda: True)
+
+        result = build([saml_entry(userinfo_groups=True)])
+
+        assert result.providers == []
+        assert any("'userinfo_groups' applies only to an 'oidc' provider" in error for error in result.errors)
+
+    def test_the_legacy_provider_takes_it_from_oidc_userinfo_groups(self):
+        assert build(app_config=legacy_app_config(OIDC_USERINFO_GROUPS=True)).providers[0].userinfo_groups is True
+        assert build(app_config=legacy_app_config(OIDC_USERINFO_GROUPS=False)).providers[0].userinfo_groups is False
+        # Absent (an AppConfig from before the setting existed) and anything but a real boolean: off.
+        assert build(app_config=legacy_app_config()).providers[0].userinfo_groups is False
+        assert build(app_config=legacy_app_config(OIDC_USERINFO_GROUPS="true")).providers[0].userinfo_groups is False
 
 
 class TestAllowTokensWithoutExpiry:
@@ -1064,11 +1161,12 @@ class TestSamlMetadataFetch:
                 def close(self):
                     pass
 
-            def _get(url, **kwargs):
-                seen.update(kwargs, url=url)
+            def _get(session, url, **kwargs):
+                seen.update(kwargs, url=url, session=session)
                 return _Response()
 
-            monkeypatch.setattr(requests, "get", _get)
+            # The fetch goes through the system-trust session (mlflow_oidc_auth/http_client.py).
+            monkeypatch.setattr(requests.Session, "get", _get)
             return seen
 
         return _install

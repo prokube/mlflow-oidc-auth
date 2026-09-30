@@ -19,8 +19,6 @@ class SqlUser(Base):
     id: Mapped[int] = mapped_column(Integer(), primary_key=True)
     username: Mapped[str] = mapped_column(String(255), unique=True)
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    password_expiration: Mapped[datetime] = mapped_column(nullable=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     is_service_account: Mapped[bool] = mapped_column(Boolean, default=False)
     # Phase 0 lifecycle columns (issue #333). Schema only — nothing enforces ``active`` or
@@ -55,8 +53,6 @@ class SqlUser(Base):
             id_=self.id,
             username=self.username,
             display_name=self.display_name,
-            password_hash=self.password_hash,
-            password_expiration=self.password_expiration,
             is_admin=self.is_admin,
             is_service_account=self.is_service_account,
             active=self.active,
@@ -77,6 +73,10 @@ class SqlGroup(Base):
     group_name: Mapped[str] = mapped_column(String(255), nullable=False)
     # Phase 0 lifecycle columns (issue #333); see SqlUser for why they carry no behaviour yet.
     external_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Which source created the group (#323 review): ``manual`` (administrator, CLI, or any group
+    # that predates the column), ``scim``, or ``oidc:<id>`` / ``saml:<id>`` for a group a login
+    # created. SCIM may write only groups it owns under ``enforce``.
+    managed_by: Mapped[str] = mapped_column(String(255), nullable=False, server_default="manual", default="manual")
     # Nullable at the DB level: they are added to an existing table, and SQLite refuses
     # ADD COLUMN with a non-constant default once the table has rows. The migration backfills
     # existing rows; ``default`` populates new ones.

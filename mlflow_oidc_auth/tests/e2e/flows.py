@@ -7,7 +7,7 @@ import threading
 from typing import List, Optional
 from urllib.parse import urljoin, urlparse
 
-import httpx
+import httpx2 as httpx
 
 from mlflow_oidc_auth.tests.e2e.browser import Browser, is_ui_redirect, parse_forms
 from mlflow_oidc_auth.tests.e2e.harness import PASSWORDS, AppServer, keycloak_verify
@@ -43,8 +43,8 @@ def drive_to_app(browser: Browser, response: httpx.Response, app: AppServer, use
     Returns the app's non-redirect response, or — when the flow ends in the plugin's SPA — the
     redirect into it, unfollowed (use ``landing_url``). Handles every page Keycloak shows on the
     way: its login form (credentials for ``username``), the SAML HTTP-POST auto-submit form (posted
-    to the app with no cookies, as a cross-site POST under ``SameSite=Lax`` is), and its logout
-    confirmation.
+    to the app as a cross-site POST: only its ``SameSite=None`` cookies — the SAML binding cookie —
+    go with it, never the ``Lax`` session cookie), and its logout confirmation.
     """
     for _ in range(12):
         response = browser.follow(response)

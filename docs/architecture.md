@@ -40,14 +40,22 @@ FastAPI handles authentication, the admin UI, and the permission management API.
 Middleware is applied to every request. The execution order (outermost to innermost) is:
 
 ```
-Request → ProxyHeaders → Auth → WorkspaceContext → Session → Route Handler
+Request → ProxyHeaders → Session → WorkspaceContext → Auth → FastAPIPermission → Route Handler
 ```
+
+`ProxyHeadersMiddleware` runs first so a forwarded path prefix from a trusted proxy is recorded
+in the ASGI `root_path` before any workspace resolution or authorization decision.
+`WorkspaceContextMiddleware` resolves the workspace on the same routed path. `AuthMiddleware` and the FastAPI permission
+middleware both decide on the **routed path** — the request path with that prefix removed, which
+is the path the router dispatches on — so the unprotected-route list and the validator mapping
+always describe the endpoint that serves the request, whether or not the deployment sits under
+a prefix. The wiring lives in `add_middleware_stack()` in `app.py`.
 
 | Middleware | Purpose |
 |-----------|---------|
-| **ProxyHeadersMiddleware** | Reads `X-Forwarded-*` headers from reverse proxies. Updates the request's scheme, host, port, and client IP. When `TRUSTED_PROXIES` is configured, only applies headers from requests originating within the trusted CIDR ranges |
+| **ProxyHeadersMiddleware** | Reads `X-Forwarded-*` headers from reverse proxies. Updates the request's scheme, host, port, and path prefix (`root_path`), and records the forwarded client IP under its own scope key (`client_address()`; `request.client` is left as the connection address). Applies headers only from requests originating within the `TRUSTED_PROXIES` CIDR ranges; when it is unset, no proxy is trusted, the headers are ignored from every client and this is logged once at startup |
 | **AuthMiddleware** | Authenticates the user via basic auth, JWT bearer token, or session cookie. Sets `request.state.username`, `request.state.is_admin`, and `request.scope["mlflow_oidc_auth"]`. When `OIDC_AUDIENCE` is configured, JWT `aud` claim is validated |
-| **FastAPIPermissionMiddleware** | Enforces RBAC on MLflow's native FastAPI routers (gateway invocations, chat completions, embeddings). Extracts the gateway endpoint name from the URL path and checks USE permission before forwarding. On the MCP server registry, reads are open to any authenticated user and mutations are admin-only |
+| **FastAPIPermissionMiddleware** | Enforces RBAC on MLflow's native FastAPI routers (gateway invocations, chat completions, embeddings). Extracts the gateway endpoint name from the routed path and checks USE permission before forwarding. On the MCP server registry, reads are open to any authenticated user and mutations are admin-only. Fails closed: any request not dispatched to the Flask mount and not on an unprotected route must carry an authenticated user, even where no validator is mapped |
 | **WorkspaceContextMiddleware** | When workspaces are enabled, reads the `X-MLFLOW-WORKSPACE` header and sets MLflow's workspace ContextVar so tracking store operations run in the correct workspace |
 | **SessionMiddleware** | Starlette's built-in cookie-based session. Decodes/encodes the signed session cookie |
 
@@ -79,6 +87,19 @@ Authorization: Basic base64(username:password)
 ```
 
 Authenticates against the plugin's user database. Used by MLflow CLI/SDK (`mlflow.set_tracking_uri()` with credentials).
+
+The password is one of the user's named access tokens (issue #189): a lookup by the token's
+8-character prefix finds the one candidate row (or, for a secret carried over from before this
+feature, the user's single prefix-less row), and a single password-hash check verifies it —
+however many tokens the user holds. A live token must not be expired. On a hit, `last_used_at` is
+updated, at most once a minute per token.
+
+Issuing a new token (`POST /users/current/tokens`, `POST /users/{username}/tokens`, or
+`PATCH /users/access-token`) is refused when the request itself was authenticated this way:
+`require_interactive_login` checks `request.state.auth_method`, set by `AuthMiddleware`, and
+requires a session or a bearer token from an interactive IdP instead. A bearer token from a
+non-interactive provider (Kubernetes, `interactive: false`) is labelled `workload` and refused too.
+A leaked or short-lived credential must not be able to mint a year-long replacement.
 
 ### 2. JWT Bearer Token
 
@@ -298,7 +319,7 @@ The `mlflow-oidc-server` command:
 
 `create_app()` in `mlflow_oidc_auth/app.py`:
 1. Creates the FastAPI application
-2. Configures the middleware stack (Session → Workspace → Auth → Proxy)
+2. Configures the middleware stack via `add_middleware_stack()` (outermost first: Proxy → Session → Workspace → Auth → Permission)
 3. Registers all routers
 4. Creates the MLflow Flask app
 5. Mounts Flask via `AuthAwareWSGIMiddleware`

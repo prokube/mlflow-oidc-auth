@@ -7,21 +7,22 @@ from fastapi.responses import JSONResponse
 from mlflow.exceptions import MlflowException
 
 from mlflow_oidc_auth.audit import emit_audit_event
-from mlflow_oidc_auth.config import config
-from mlflow_oidc_auth.dependencies import check_admin_permission
+from mlflow_oidc_auth.dependencies import check_admin_permission, require_interactive_login
 from mlflow_oidc_auth.logger import get_logger
 from mlflow_oidc_auth.models import (
     CreateAccessTokenRequest,
     CreateUserRequest,
+    CreateUserTokenRequest,
     CurrentUserProfile,
     GroupRecord,
 )
 from mlflow_oidc_auth.models.scim import UserActiveRequest
 from mlflow_oidc_auth.orphans import delete_user_reporting_orphans, report_orphans
-from mlflow_oidc_auth.ownership import MANUAL, evaluate_write
-from mlflow.protos.databricks_pb2 import INVALID_STATE, ErrorCode
+from mlflow_oidc_auth.ownership import MANUAL, OWNER_PATTERN
+from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE, INVALID_STATE, RESOURCE_ALREADY_EXISTS, RESOURCE_DOES_NOT_EXIST, ErrorCode
+from mlflow_oidc_auth.repository.user_token import DEFAULT_TOKEN_NAME, MAX_TOKEN_LIFETIME
 from mlflow_oidc_auth.store import store
-from mlflow_oidc_auth.user import create_user, generate_token
+from mlflow_oidc_auth.user import create_user
 from mlflow_oidc_auth.utils import get_is_admin, get_username
 
 from ._prefix import USERS_ROUTER_PREFIX
@@ -45,138 +46,263 @@ CURRENT_USER = "/current"
 USERNAME = "/{username}"
 USERS_DETAILS = "/details"
 USER_ACTIVE = "/{username}/active"
+USER_SESSIONS = "/{username}/sessions"
+USER_SESSION = "/{username}/sessions/{session_pk}"
+USER_TOKENS = "/current/tokens"
+USER_TOKEN = "/current/tokens/{token_id}"
+USER_TOKENS_OF = "/{username}/tokens"
+USER_TOKEN_OF = "/{username}/tokens/{token_id}"
+
+#: The lifetime of a ``default`` token issued by ``PATCH /users/access-token`` without an expiration.
+DEFAULT_TOKEN_LIFETIME = timedelta(days=365)
 
 #: Fields of each object returned by ``GET /users/details`` and ``PATCH /users/{username}/active``.
 USER_DETAIL_FIELDS = ("username", "display_name", "is_admin", "is_service_account", "active", "managed_by")
 
 
+def _parse_expiration(value: Optional[str]) -> datetime:
+    """Parse a requested token expiry, as an aware UTC datetime.
+
+    Raises:
+        HTTPException: 400 when it is not ISO 8601, is in the past, or is more than a year away.
+    """
+    expiration_str = value or ""
+    # Handle ISO 8601 with 'Z' (UTC) at the end
+    if expiration_str.endswith("Z"):
+        expiration_str = expiration_str[:-1] + "+00:00"
+    try:
+        expiration = datetime.fromisoformat(expiration_str)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid expiration date format")
+    # An ISO 8601 timestamp carries no offset unless one is written, and both "2027-01-01" and
+    # "2027-01-01T00:00:00" are valid. This layer deals in UTC — the 'Z' handling above says so —
+    # so a missing offset is read as UTC rather than rejected (issue #338).
+    if expiration.tzinfo is None:
+        expiration = expiration.replace(tzinfo=timezone.utc)
+    expiration = expiration.astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+    if expiration <= now:
+        raise HTTPException(status_code=400, detail="Expiration date must be in the future")
+    if expiration > now + MAX_TOKEN_LIFETIME:
+        raise HTTPException(status_code=400, detail="Expiration date must be less than 1 year in the future")
+    return expiration
+
+
+_TOKEN_ERROR_STATUS = {
+    ErrorCode.Name(INVALID_PARAMETER_VALUE): 400,
+    ErrorCode.Name(RESOURCE_DOES_NOT_EXIST): 404,
+    ErrorCode.Name(RESOURCE_ALREADY_EXISTS): 409,
+    ErrorCode.Name(INVALID_STATE): 409,
+}
+
+
+def _token_http_error(e: MlflowException) -> HTTPException:
+    """Map a token repository refusal to its HTTP status. Anything unexpected is a 500."""
+    status = _TOKEN_ERROR_STATUS.get(e.error_code)
+    if status is None:
+        logger.error("Access token operation failed: %s", type(e).__name__)
+        return HTTPException(status_code=500, detail="Access token operation failed")
+    return HTTPException(status_code=status, detail=e.message)
+
+
+def _require_user(username: str) -> str:
+    """The stored username of ``username``, or a 404."""
+    try:
+        user = store.get_user_profile(username)
+    except MlflowException:
+        user = None
+    if user is None:
+        raise HTTPException(status_code=404, detail=f"User {username} not found")
+    return user.username
+
+
+def _ensure_local_tokens_allowed(username: str) -> str:
+    """Return the stored username unless the account must use workload credentials."""
+    try:
+        profile = store.get_user_profile(username)
+    except MlflowException:
+        profile = None
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"User {username} not found")
+    if isinstance(profile.managed_by, str) and profile.managed_by.startswith(("spiffe:", "workload:")):
+        raise HTTPException(
+            status_code=403,
+            detail="Workload identities cannot create local access tokens",
+        )
+    return profile.username
+
+
 @users_router.patch(
     CREATE_ACCESS_TOKEN,
     summary="Create user access token",
-    description="Creates a new access token for the authenticated user.",
+    description="Issues a new 'default' access token for the authenticated user, replacing the previous one. "
+    "Admins may issue one for another user. The token expires at most one year from now. Requires a signed-in "
+    "session: a request authenticated with an access token is refused.",
+    dependencies=[Depends(require_interactive_login)],
 )
 async def create_access_token(
     token_request: Optional[CreateAccessTokenRequest] = Body(None),
     current_username: str = Depends(get_username),
     is_admin: bool = Depends(get_is_admin),
 ) -> JSONResponse:
-    """
-    Create a new access token for the authenticated user.
+    """Replace a user's ``default`` access token (issue #189).
 
-    This endpoint creates a new access token for the authenticated user.
-    Optionally accepts expiration date and username (if different from current user).
+    The endpoint every existing client uses. It now issues a named token, ``default``, and deletes
+    the previous ``default`` token in the same transaction; the user's other named tokens are left
+    as they are (``DELETE /users/{username}/tokens`` revokes them all). Tokens must expire: an
+    omitted ``expiration`` means one year from now, never "does not expire".
 
     Parameters:
-    -----------
-    token_request : Optional[CreateAccessTokenRequest]
-        Optional request body with token creation parameters.
-    current_username : str
-        The authenticated username (injected by dependency).
-    is_admin : bool
-        Whether the authenticated user has admin permissions.
+        token_request: Optional ``username`` (admins only, for another user) and ``expiration``.
+        current_username: The authenticated username (injected).
+        is_admin: Whether the authenticated user is an administrator (injected).
 
     Returns:
-    --------
-    JSONResponse
-        A JSON response containing the new access token.
+        JSONResponse: ``{"token", "expires_at", "message"}``. The token is shown only here.
+
+    Like every endpoint that issues a token, it refuses a request authenticated with an access
+    token (``require_interactive_login``): a leaked token must not be able to mint another.
 
     Raises:
-    -------
-    HTTPException
-        If there is an error creating the access token.
+        HTTPException: 403 for a non-admin naming another user or when authenticated with an
+            access token, 404 for an unknown user, 400 for a bad expiration, 409 at the per-user
+            token cap.
     """
+    # Determine which username to use for token creation.
+    # - Default: rotate the authenticated user's token.
+    # - Admins: may rotate tokens for other users.
+    # - Non-admins: may not rotate tokens for other users.
+    if token_request and token_request.username:
+        target_username = token_request.username
+        if target_username != current_username and not is_admin:
+            raise HTTPException(status_code=403, detail="Administrator privileges required for this operation")
+    else:
+        target_username = current_username
+
+    if token_request and token_request.expiration:
+        expiration = _parse_expiration(token_request.expiration)
+        expiration_defaulted = False
+    else:
+        expiration = datetime.now(timezone.utc) + DEFAULT_TOKEN_LIFETIME
+        expiration_defaulted = True
+
+    # get_user_profile raises rather than returning None; a mistyped username is a 404, not a 500
+    # (issue #338).
+    target_username = _ensure_local_tokens_allowed(target_username)
     try:
-        # Determine which username to use for token creation.
-        # - Default: rotate the authenticated user's token.
-        # - Admins: may rotate tokens for other users.
-        # - Non-admins: may not rotate tokens for other users.
-        if token_request and token_request.username:
-            target_username = token_request.username
-            if target_username != current_username and not is_admin:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Administrator privileges required for this operation",
-                )
-        else:
-            target_username = current_username
+        record, plaintext, replaced = store.replace_user_token(target_username, DEFAULT_TOKEN_NAME, expiration, created_by=current_username)
+    except MlflowException as e:
+        raise _token_http_error(e)
 
-        # Parse expiration date if provided
-        expiration = None
-        if token_request and token_request.expiration:
-            expiration_str = token_request.expiration
-            # Handle ISO 8601 with 'Z' (UTC) at the end
-            if expiration_str.endswith("Z"):
-                expiration_str = expiration_str[:-1] + "+00:00"
+    emit_audit_event(
+        "user.token_rotate",
+        actor=current_username,
+        resource_type="user",
+        resource_id=target_username,
+        detail={
+            "token_id": record.id,
+            "token_prefix": record.token_prefix,
+            "name": record.name,
+            "expiration": record.to_json()["expires_at"],
+            "expiration_defaulted": expiration_defaulted,
+            "replaced": replaced,
+        },
+    )
+    return JSONResponse(
+        content={
+            "token": plaintext,
+            "expires_at": record.to_json()["expires_at"],
+            "message": f"Token for {target_username} has been created",
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
-            try:
-                expiration = datetime.fromisoformat(expiration_str)
-                # An ISO 8601 timestamp carries no offset unless one is written, and both
-                # "2027-01-01" and "2027-01-01T00:00:00" are valid. Comparing a naive datetime
-                # to an aware one raises TypeError, which is not a ValueError and so used to
-                # escape as a 500. This layer deals in UTC — the 'Z' handling above says so —
-                # so read a missing offset as UTC rather than rejecting the request (issue #338).
-                if expiration.tzinfo is None:
-                    expiration = expiration.replace(tzinfo=timezone.utc)
-                now = datetime.now(timezone.utc)
 
-                if expiration < now:
-                    raise HTTPException(status_code=400, detail="Expiration date must be in the future")
+def _issue_token(target_username: str, token_request: CreateUserTokenRequest, actor: str) -> JSONResponse:
+    expiration = _parse_expiration(token_request.expiration)
+    target_username = _ensure_local_tokens_allowed(target_username)
+    try:
+        record, plaintext = store.create_user_token(target_username, token_request.name, expiration, created_by=actor)
+    except MlflowException as e:
+        raise _token_http_error(e)
+    emit_audit_event(
+        "user.token_create",
+        actor=actor,
+        resource_type="user",
+        resource_id=target_username,
+        detail={"token_id": record.id, "token_prefix": record.token_prefix, "name": record.name, "expiration": record.to_json()["expires_at"]},
+    )
+    return JSONResponse(content={**record.to_json(), "token": plaintext}, status_code=201, headers={"Cache-Control": "no-store"})
 
-                if expiration > now + timedelta(days=366):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Expiration date must be less than 1 year in the future",
-                    )
-            except (ValueError, TypeError):
-                # TypeError is belt-and-braces: the normalization above should make it
-                # unreachable, but a bad expiration must never become a 500.
-                raise HTTPException(status_code=400, detail=f"Invalid expiration date format")
 
-        # Check if the target user exists. get_user_profile raises rather than returning None,
-        # so without this the outer handler turns a mistyped username into a 500 (issue #338).
-        try:
-            user = store.get_user_profile(target_username)
-        except MlflowException:
-            raise HTTPException(status_code=404, detail=f"User {target_username} not found")
-        if user is None:
-            raise HTTPException(status_code=404, detail=f"User {target_username} not found")
+def _list_tokens(target_username: str) -> JSONResponse:
+    target_username = _require_user(target_username)
+    try:
+        records = store.list_user_tokens(target_username)
+    except MlflowException as e:
+        raise _token_http_error(e)
+    return JSONResponse(content={"tokens": [r.to_json() for r in records]}, headers={"Cache-Control": "no-store"})
 
-        # Generate new token and update user. The new token carries exactly the expiration
-        # requested here; it never inherits the previous token's (issue #338).
-        previous_expiration = user.password_expiration
-        new_token = generate_token()
-        # An administrator acting through the admin API is break glass by definition: they must
-        # be able to repair a row a directory owns, and the attempt is audited either way (#319).
-        store.update_user(username=target_username, password=new_token, password_expiration=expiration, written_by="manual", admin_override=True)
-        emit_audit_event(
-            "user.token_rotate",
-            actor=current_username,
-            resource_type="user",
-            resource_id=target_username,
-            detail={
-                "expiration": expiration.isoformat() if expiration else None,
-                # Rotating without an expiration replaces an expiring token with one that does
-                # not expire. That is a deliberate widening of the credential's lifetime, so it
-                # is recorded rather than left silent.
-                "expiration_cleared": previous_expiration is not None and expiration is None,
-            },
-        )
 
-        return JSONResponse(
-            content={
-                "token": new_token,
-                "message": f"Token for {target_username} has been created",
-            }
-        )
+def _delete_token(target_username: str, token_id: int, actor: str) -> JSONResponse:
+    target_username = _require_user(target_username)
+    try:
+        record = store.delete_user_token(target_username, token_id)
+    except MlflowException as e:
+        raise _token_http_error(e)
+    emit_audit_event(
+        "user.token_delete",
+        actor=actor,
+        resource_type="user",
+        resource_id=target_username,
+        detail={"token_id": record.id, "token_prefix": record.token_prefix, "name": record.name},
+    )
+    return JSONResponse(content={"deleted": 1})
 
-    except HTTPException:
-        # Re-raise HTTPExceptions as-is
-        raise
-    except Exception as e:
-        # Log unexpected errors and return a generic error response
 
-        logger.error(f"Error creating access token: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to create access token")
+@users_router.get(
+    USER_TOKENS,
+    summary="List my access tokens",
+    description="Lists the authenticated user's access tokens, expired ones included. Never returns a token's secret.",
+)
+async def list_my_tokens(current_username: str = Depends(get_username)) -> JSONResponse:
+    """The caller's own access tokens (issue #189)."""
+    return _list_tokens(current_username)
+
+
+@users_router.post(
+    USER_TOKENS,
+    summary="Create an access token",
+    description="Issues a named access token for the authenticated user. Requires a signed-in session: "
+    "a request authenticated with an access token is refused. The token is returned once.",
+    dependencies=[Depends(require_interactive_login)],
+)
+async def create_my_token(
+    token_request: CreateUserTokenRequest = Body(...),
+    current_username: str = Depends(get_username),
+) -> JSONResponse:
+    """Issue a named token for the caller (issue #189).
+
+    Raises:
+        HTTPException: 403 when authenticated with an access token, 400 for a bad name or
+            expiration, 409 for a duplicate name or at the per-user cap.
+    """
+    return _issue_token(current_username, token_request, actor=current_username)
+
+
+@users_router.delete(
+    USER_TOKEN,
+    summary="Delete one of my access tokens",
+    description="Deletes one of the authenticated user's access tokens. It stops working immediately.",
+)
+async def delete_my_token(token_id: int, current_username: str = Depends(get_username)) -> JSONResponse:
+    """Delete one of the caller's tokens (issue #189). Allowed with any credential: it only removes access.
+
+    Raises:
+        HTTPException: 404 if the caller holds no token with that id — someone else's token reads
+            exactly like one that does not exist.
+    """
+    return _delete_token(current_username, token_id, actor=current_username)
 
 
 @users_router.get(
@@ -262,6 +388,7 @@ async def create_new_user(
             display_name=user_request.display_name,
             is_admin=user_request.is_admin,
             is_service_account=user_request.is_service_account,
+            written_by="manual",
         )
 
         if status:
@@ -293,7 +420,8 @@ async def create_new_user(
 )
 async def set_user_ownership(
     username: str = Body(..., description="The user whose ownership is being changed"),
-    managed_by: str = Body(..., description="The new owner: 'manual', 'scim', or 'oidc:<provider-id>'"),
+    managed_by: str = Body(..., description="The new owner: 'manual', 'scim', 'oidc:<provider-id>' or 'saml:<provider-id>'"),
+    memberships: bool = Body(False, description="Also hand every group membership of the user to the new owner"),
     admin_username: str = Depends(check_admin_permission),
 ) -> JSONResponse:
     """Hand a user row to a different source (issue #319).
@@ -306,9 +434,14 @@ async def set_user_ownership(
     and become editable again. ``mlflow-oidc db reconcile-ownership`` does the same thing in
     bulk, for an operator who does have a shell.
 
+    With ``memberships: true`` the user's group memberships (#360), which carry their own owner,
+    are handed over too — otherwise a decommissioned source's grants could not be removed by any
+    other source under ``enforce``.
+
     Parameters:
         username: The user whose ownership is being changed.
         managed_by: The new owner.
+        memberships: Whether to re-own the user's group memberships as well.
         admin_username: The authenticated administrator (injected).
 
     Returns:
@@ -318,36 +451,44 @@ async def set_user_ownership(
         HTTPException: 400 if the owner is not one a source presents, 404 if there is no such
             user.
     """
-    if not re.fullmatch(r"manual|scim|oidc:[A-Za-z0-9._-]+", managed_by or ""):
-        raise HTTPException(status_code=400, detail="managed_by must be 'manual', 'scim', or 'oidc:<provider-id>'")
+    if not re.fullmatch(OWNER_PATTERN, managed_by or ""):
+        raise HTTPException(status_code=400, detail="managed_by must be 'manual', 'scim', 'oidc:<provider-id>' or 'saml:<provider-id>'")
 
     try:
         store.get_user_profile(username)
     except MlflowException:
         raise HTTPException(status_code=404, detail=f"User {username} not found")
 
-    previous = store.get_user_profile(username).managed_by
-    store.update_user(username=username, managed_by=managed_by, written_by="manual", admin_override=True)
+    try:
+        # One transaction for the user row and its memberships: a failure in either half leaves
+        # both as they were.
+        result = store.hand_over_user(username, managed_by, memberships=memberships is True, actor=admin_username)
+    except Exception as e:
+        logger.error("Handing %s to %s failed: %s", username, managed_by, type(e).__name__)
+        emit_audit_event(
+            "user.ownership_set",
+            actor=admin_username,
+            resource_type="user",
+            resource_id=username,
+            detail={"to": managed_by, "memberships": memberships is True, "applied": False},
+            status="error",
+        )
+        raise HTTPException(status_code=500, detail="Failed to change ownership; nothing was changed")
+    previous = result["previous"]
+    detail = {"from": previous, "to": managed_by}
+    content = {"username": username, "managed_by": managed_by, "previous": previous}
+    if memberships is True:
+        detail["memberships"] = [{"group": group, "from": owner} for group, owner in result["memberships"]]
+        content["memberships"] = detail["memberships"]
     emit_audit_event(
         "user.ownership_set",
         actor=admin_username,
         resource_type="user",
         resource_id=username,
-        detail={"from": previous, "to": managed_by},
+        detail=detail,
     )
     logger.info("Administrator %s set ownership of %s from %s to %s", admin_username, username, previous, managed_by)
-    return JSONResponse(content={"username": username, "managed_by": managed_by, "previous": previous}, status_code=200)
-
-
-def _audit_delete_conflict(username: str, decision, admin_username: str) -> None:
-    emit_audit_event(
-        "user.ownership_conflict",
-        actor=admin_username,
-        resource_type="user",
-        resource_id=username,
-        detail={"owner": decision.owner, "written_by": MANUAL, "reason": decision.reason, "permitted": decision.allowed, "operation": "delete"},
-        status="success" if decision.allowed else "denied",
-    )
+    return JSONResponse(content=content, status_code=200)
 
 
 @users_router.delete(
@@ -397,31 +538,27 @@ async def delete_user(
         if not detail:
             raise HTTPException(status_code=404, detail=f"User {username} not found")
 
-        decision = evaluate_write(
-            detail.get("managed_by"),
-            MANUAL,
-            enforcement=config.MANAGED_BY_ENFORCEMENT,
-            admin_override=admin_override is True,
-            fields={"deleted"},
-            target_is_admin=bool(detail.get("is_admin")),
-        )
-        if decision.conflict and not decision.allowed:
-            _audit_delete_conflict(username, decision, admin_username)
-            raise HTTPException(status_code=409, detail=f"User {username} is managed by {decision.owner!r}: {decision.reason}")
-
+        # The ownership guard (#360) runs inside the delete, as ``manual``: refused under enforce
+        # unless ``admin_override``, recorded as ``user.ownership_conflict`` (``operation: delete``)
+        # either way, and before anything else — so a refused delete detects and hands over nothing.
         # Orphan detection and the ORPHAN_FALLBACK_PRINCIPAL hand-over run inside the delete's own
         # transaction, before the cascade removes the grants they read: a refused delete (the last
         # active administrator) rolls the hand-over back too. They never block the delete (#324).
         try:
-            delete_user_reporting_orphans(username, actor=admin_username, source="admin", store=store)
+            delete_user_reporting_orphans(
+                username,
+                actor=admin_username,
+                source="admin",
+                store=store,
+                written_by=MANUAL,
+                admin_override=admin_override is True,
+            )
         except MlflowException as e:
-            if e.error_code == ErrorCode.Name(INVALID_STATE):
+            # The ownership guard (INVALID_PARAMETER_VALUE) and the last-active-admin invariant
+            # (INVALID_STATE): both a refusal, never a 500.
+            if e.error_code in (ErrorCode.Name(INVALID_STATE), ErrorCode.Name(INVALID_PARAMETER_VALUE)):
                 raise HTTPException(status_code=409, detail=e.message)
             raise
-        if decision.conflict:
-            # A permitted cross-source delete (report mode, or the override), recorded only once
-            # the delete has committed.
-            _audit_delete_conflict(username, decision, admin_username)
         emit_audit_event(
             "user.delete",
             actor=admin_username,
@@ -470,7 +607,7 @@ async def list_user_details(service: Optional[bool] = None, admin_username: str 
 @users_router.patch(
     USER_ACTIVE,
     summary="Activate or deactivate a user",
-    description="Sets a user's active flag. Deactivating revokes their sessions and token and keeps their grants. Admins only.",
+    description="Sets a user's active flag. Deactivating revokes their sessions and tokens and keeps their grants. Admins only.",
 )
 async def set_user_active(
     username: str,
@@ -483,9 +620,9 @@ async def set_user_active(
     directory-owned user is refused under ``MANAGED_BY_ENFORCEMENT=enforce`` unless the request
     says ``admin_override: true`` — break glass, always audited.
 
-    Deactivation revokes every live session and replaces the user's token with an undisclosed,
-    already-expired secret in one transaction. Grants are retained, so reactivation restores
-    access once the user signs in again or is issued a new token.
+    Deactivation revokes every live session and deletes every access token of the user in one
+    transaction. Grants are retained, so reactivation restores access once the user signs in again
+    or is issued a new token.
 
     Raises:
         HTTPException: 404 for an unknown user; 409 when the ownership guard refuses the write
@@ -497,8 +634,7 @@ async def set_user_active(
 
     kwargs = {"active": active_request.active, "written_by": "manual", "admin_override": active_request.admin_override}
     if active_request.active is False:
-        kwargs["password"] = generate_token()
-        kwargs["password_expiration"] = datetime.now(timezone.utc)
+        kwargs["revoke_tokens"] = True
     try:
         store.update_user(detail["username"], **kwargs)
     except MlflowException as e:
@@ -514,6 +650,82 @@ async def set_user_active(
 
     updated = store.get_user_detail(target)
     return JSONResponse(content={key: updated[key] for key in USER_DETAIL_FIELDS})
+
+
+def _require_user_detail(username: str) -> dict:
+    detail = store.get_user_detail(username)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"User {username} not found")
+    return detail
+
+
+@users_router.get(
+    USER_SESSIONS,
+    summary="List a user's live sessions",
+    description="Lists a user's live server-side sessions. Returns a short id prefix and an opaque `pk`, never the session id. Admins only.",
+)
+async def list_user_sessions(username: str, admin_username: str = Depends(check_admin_permission)) -> JSONResponse:
+    """A user's live sessions, newest first (issue #325).
+
+    The full session id is a bearer credential, so it is never returned: ``session_id_prefix``
+    tells sessions apart and ``pk`` addresses one for revocation. ``last_seen_at`` is recorded
+    only where something writes it; the per-request authentication path does not.
+
+    Raises:
+        HTTPException: 404 for an unknown user.
+    """
+    target = _require_user_detail(username)["username"]
+    return JSONResponse(
+        content={"sessions": [summary.to_json() for summary in store.list_live_auth_session_details(target)]}, headers={"Cache-Control": "no-store"}
+    )
+
+
+@users_router.delete(
+    USER_SESSION,
+    summary="Revoke one of a user's sessions",
+    description="Revokes one live session of this user, addressed by the `pk` from the session list. Admins only.",
+)
+async def revoke_user_session(username: str, session_pk: int, admin_username: str = Depends(check_admin_permission)) -> JSONResponse:
+    """Revoke one session (issue #325). Effective on the session's next request.
+
+    Raises:
+        HTTPException: 404 for an unknown user, or a ``pk`` that is not a live session of *this*
+            user — another user's session reads exactly like one that does not exist.
+    """
+    target = _require_user_detail(username)["username"]
+    if not store.revoke_auth_session_by_pk(target, session_pk):
+        raise HTTPException(status_code=404, detail="Session not found")
+    emit_audit_event(
+        "session.revoked",
+        actor=admin_username,
+        resource_type="user",
+        resource_id=target,
+        detail={"source": "admin", "sessions": 1, "session_pk": session_pk, "reason": "admin_revoke"},
+    )
+    return JSONResponse(content={"revoked": 1})
+
+
+@users_router.delete(
+    USER_SESSIONS,
+    summary="Revoke all of a user's sessions",
+    description="Revokes every live session of this user. Their access tokens are not affected. Admins only.",
+)
+async def revoke_user_sessions(username: str, admin_username: str = Depends(check_admin_permission)) -> JSONResponse:
+    """Sign a user out everywhere (issue #325). Their account, grants and access tokens are untouched.
+
+    Raises:
+        HTTPException: 404 for an unknown user.
+    """
+    target = _require_user_detail(username)["username"]
+    count = store.revoke_all_auth_sessions(target)
+    emit_audit_event(
+        "session.revoked",
+        actor=admin_username,
+        resource_type="user",
+        resource_id=target,
+        detail={"source": "admin", "sessions": count, "reason": "admin_revoke_all"},
+    )
+    return JSONResponse(content={"revoked": count})
 
 
 @users_router.get(
@@ -554,7 +766,6 @@ async def get_current_user_information(
             display_name=user.display_name,
             is_admin=bool(user.is_admin),
             is_service_account=bool(user.is_service_account),
-            password_expiration=user.password_expiration.isoformat() if user.password_expiration else None,
             groups=[GroupRecord(**g.to_json()) for g in (user.groups or [])],
         )
     except Exception as e:
@@ -600,9 +811,82 @@ async def get_user_information(username: str, admin_username: str = Depends(chec
             display_name=user.display_name,
             is_admin=bool(user.is_admin),
             is_service_account=bool(user.is_service_account),
-            password_expiration=user.password_expiration.isoformat() if user.password_expiration else None,
             groups=[GroupRecord(**g.to_json()) for g in (user.groups or [])],
         )
     except Exception as e:
         logger.error(f"Error getting user information for {username}: {str(e)}")
         raise HTTPException(status_code=404, detail="User not found")
+
+
+@users_router.get(
+    USER_TOKENS_OF,
+    summary="List a user's access tokens",
+    description="Lists a user's access tokens, expired ones included. Never returns a token's secret. Admins only.",
+)
+async def list_user_tokens(username: str, admin_username: str = Depends(check_admin_permission)) -> JSONResponse:
+    """Another user's access tokens (issue #189).
+
+    Raises:
+        HTTPException: 404 for an unknown user.
+    """
+    return _list_tokens(username)
+
+
+@users_router.post(
+    USER_TOKENS_OF,
+    summary="Create an access token for a user",
+    description="Issues a named access token for a user or service account. Admins only, from a signed-in session. " "The token is returned once.",
+    dependencies=[Depends(require_interactive_login)],
+)
+async def create_user_token(
+    username: str,
+    token_request: CreateUserTokenRequest = Body(...),
+    admin_username: str = Depends(check_admin_permission),
+) -> JSONResponse:
+    """Issue a named token for another user (issue #189). Audited as ``user.token_create``.
+
+    Raises:
+        HTTPException: 403 unless an administrator in a signed-in session, 404 for an unknown user,
+            400 for a bad name or expiration, 409 for a duplicate name or at the per-user cap.
+    """
+    return _issue_token(username, token_request, actor=admin_username)
+
+
+@users_router.delete(
+    USER_TOKEN_OF,
+    summary="Delete one of a user's access tokens",
+    description="Deletes one access token of a user. It stops working immediately. Admins only.",
+)
+async def delete_user_token(username: str, token_id: int, admin_username: str = Depends(check_admin_permission)) -> JSONResponse:
+    """Delete one of another user's tokens (issue #189). Audited as ``user.token_delete``.
+
+    Raises:
+        HTTPException: 404 for an unknown user, or a token id that is not one of *this* user's.
+    """
+    return _delete_token(username, token_id, actor=admin_username)
+
+
+@users_router.delete(
+    USER_TOKENS_OF,
+    summary="Revoke all of a user's access tokens",
+    description="Deletes every access token of a user — the response to a leaked token. Their sessions are not affected. Admins only.",
+)
+async def revoke_user_tokens(username: str, admin_username: str = Depends(check_admin_permission)) -> JSONResponse:
+    """Delete every token of a user (issue #189). Audited as ``user.tokens_revoked``.
+
+    Raises:
+        HTTPException: 404 for an unknown user.
+    """
+    target = _require_user(username)
+    try:
+        count = store.delete_user_tokens(target)
+    except MlflowException as e:
+        raise _token_http_error(e)
+    emit_audit_event(
+        "user.tokens_revoked",
+        actor=admin_username,
+        resource_type="user",
+        resource_id=target,
+        detail={"tokens": count, "reason": "admin_revoke_all"},
+    )
+    return JSONResponse(content={"revoked": count})

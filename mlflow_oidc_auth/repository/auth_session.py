@@ -57,6 +57,7 @@ class ResolvedSession:
         provider_id: Registry id of the provider that authenticated the session, when recorded.
         encrypted_tokens: The session's provider tokens, encrypted (see ``session.token_vault``).
             Kept out of ``repr`` so it cannot reach a log line by accident.
+        managed_by: Source that owns the user row, used to reject workload sessions.
     """
 
     username: str
@@ -67,6 +68,37 @@ class ResolvedSession:
     session_id: Optional[str] = None
     provider_id: Optional[str] = None
     encrypted_tokens: Optional[str] = field(default=None, repr=False)
+    managed_by: str = "manual"
+
+
+#: How much of a session id the admin API shows. Enough to tell a user's handful of sessions
+#: apart; far too little to present as a cookie (the id is 256 bits).
+SESSION_ID_PREFIX_LENGTH = 8
+
+
+@dataclass(frozen=True)
+class SessionSummary:
+    """A live session as an administrator sees it. Carries no full session id and no tokens."""
+
+    pk: int
+    session_id_prefix: str
+    provider_id: Optional[str]
+    created_at: Optional[datetime]
+    last_seen_at: Optional[datetime]
+    expires_at: Optional[datetime]
+
+    def to_json(self) -> dict:
+        def iso(value: Optional[datetime]) -> Optional[str]:
+            return value.replace(tzinfo=timezone.utc).isoformat() if value else None
+
+        return {
+            "pk": self.pk,
+            "session_id_prefix": self.session_id_prefix,
+            "provider_id": self.provider_id,
+            "created_at": iso(self.created_at),
+            "last_seen_at": iso(self.last_seen_at),
+            "expires_at": iso(self.expires_at),
+        }
 
 
 class _KeyedLocks:
@@ -223,6 +255,7 @@ class AuthSessionRepository:
                     SqlAuthSession.session_id,
                     SqlAuthSession.provider_id,
                     SqlAuthSession.encrypted_tokens,
+                    SqlUser.managed_by,
                 )
                 .join(SqlAuthSession, SqlAuthSession.user_id == SqlUser.id)
                 .filter(
@@ -243,6 +276,7 @@ class AuthSessionRepository:
                 session_id=row[5],
                 provider_id=row[6],
                 encrypted_tokens=row[7],
+                managed_by=row[8],
             )
 
     def store_tokens(self, session_id: str, encrypted_tokens: Optional[str]) -> bool:
@@ -390,6 +424,67 @@ class AuthSessionRepository:
                 .all()
             )
             return [row[0] for row in rows]
+
+    def list_live_details_for_user(self, username: str) -> List["SessionSummary"]:
+        """``username``'s live sessions, newest first, for the admin API (#325).
+
+        The full session id is a bearer credential — whoever holds it *is* the session — so it
+        never leaves this method: callers get a short prefix to tell sessions apart and the row's
+        primary key to revoke one by.
+        """
+        username = normalize_username(username)
+        with self._Session() as session:
+            rows = (
+                session.query(
+                    SqlAuthSession.id,
+                    SqlAuthSession.session_id,
+                    SqlAuthSession.provider_id,
+                    SqlAuthSession.created_at,
+                    SqlAuthSession.last_seen_at,
+                    SqlAuthSession.expires_at,
+                )
+                .join(SqlUser, SqlAuthSession.user_id == SqlUser.id)
+                .filter(SqlUser.username == username, SqlAuthSession.revoked_at.is_(None), SqlAuthSession.expires_at > _now())
+                .order_by(SqlAuthSession.id.desc())
+                .all()
+            )
+            return [
+                SessionSummary(
+                    pk=row[0],
+                    session_id_prefix=(row[1] or "")[:SESSION_ID_PREFIX_LENGTH],
+                    provider_id=row[2],
+                    created_at=row[3],
+                    last_seen_at=row[4],
+                    expires_at=row[5],
+                )
+                for row in rows
+            ]
+
+    def revoke_by_pk_for_user(self, username: str, session_pk: int) -> bool:
+        """Revoke one live session by primary key, only if it belongs to ``username``.
+
+        Scoped to the user in the statement itself, so a primary key from another user's list
+        revokes nothing and reads exactly like an unknown one.
+
+        Returns:
+            True if a live session of ``username`` was revoked.
+        """
+        username = normalize_username(username)
+        with self._Session(read_only=False) as session:
+            user = session.query(SqlUser.id).filter(SqlUser.username == username).one_or_none()
+            if user is None:
+                return False
+            updated = (
+                session.query(SqlAuthSession)
+                .filter(
+                    SqlAuthSession.id == session_pk,
+                    SqlAuthSession.user_id == user[0],
+                    SqlAuthSession.revoked_at.is_(None),
+                    SqlAuthSession.expires_at > _now(),
+                )
+                .update({SqlAuthSession.revoked_at: _now()}, synchronize_session=False)
+            )
+            return bool(updated)
 
     def list_live_for_provider(self, username: str, provider_id: str) -> List[Tuple[str, Optional[str]]]:
         """``(session_id, encrypted_tokens)`` for each live session ``provider_id`` opened for ``username``.

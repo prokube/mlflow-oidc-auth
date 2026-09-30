@@ -9,6 +9,8 @@ from sqlalchemy import text
 from mlflow_oidc_auth.config import config
 from mlflow_oidc_auth.repository.scim_token import parse_prefix
 
+from mlflow_oidc_auth.tests.token_helpers import set_known_token
+
 from .conftest import ADMIN, LOGIN, PROTECTED, USER_PASSWORD, basic
 
 SPC = "/scim/v2/ServiceProviderConfig"
@@ -114,7 +116,7 @@ class TestUserCredentialsDoNotAuthenticateScim:
         assert_scim_401(client.post(USERS, json={"userName": "x@example.com"}))
 
     def test_user_token_as_bearer_is_refused(self, client, bound_store):
-        bound_store.create_user("u@example.com", USER_PASSWORD, "U")
+        bound_store.create_user("u@example.com", "U")
         assert_scim_401(client.get(USERS, headers=bearer(USER_PASSWORD)))
 
 
@@ -132,7 +134,7 @@ class TestScimTokenDoesNotAuthenticateElsewhere:
 
 class TestUnmatchedScimPaths:
     def test_unsupported_resource_is_a_scim_404(self, client, scim):
-        response = client.get("/scim/v2/Groups", headers=scim)
+        response = client.get("/scim/v2/Bulk", headers=scim)
         assert response.status_code == 404
         assert response.json()["schemas"] == [ERROR_SCHEMA]
 
@@ -197,7 +199,8 @@ class TestRotation:
 
 class TestTokenAdminApi:
     def test_non_admin_is_forbidden(self, client, bound_store, admin):
-        bound_store.create_user("u@example.com", USER_PASSWORD, "U")
+        bound_store.create_user("u@example.com", "U")
+        set_known_token(bound_store, "u@example.com", USER_PASSWORD)
         user = basic("u@example.com", USER_PASSWORD)
         assert client.get(TOKENS, headers=user).status_code == 403
         response = client.post(TOKENS, headers=user, json={"name": "x"})
@@ -312,7 +315,7 @@ class TestNothingReachesTheMount:
 
     @pytest.fixture
     def mounted(self, app):
-        from starlette.middleware.wsgi import WSGIMiddleware
+        from mlflow_oidc_auth.middleware.auth_aware_wsgi_middleware import AuthAwareWSGIMiddleware
 
         calls = []
 
@@ -321,7 +324,9 @@ class TestNothingReachesTheMount:
             start_response("200 OK", [("Content-Type", "text/plain")])
             return [b"reached the mount"]
 
-        app.mount("/", WSGIMiddleware(flask_stand_in))
+        # Same adapter app.py mounts Flask through (asgiref's WsgiToAsgi), so this test
+        # exercises the real mount path rather than a separate, deprecated one.
+        app.mount("/", AuthAwareWSGIMiddleware(flask_stand_in))
         return calls
 
     @pytest.mark.parametrize("with_token", [False, True])

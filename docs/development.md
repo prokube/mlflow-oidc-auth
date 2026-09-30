@@ -151,7 +151,7 @@ mlflow-oidc-auth/
 pytest mlflow_oidc_auth/tests
 
 # Run with coverage
-coverage run -m pytest -s -m "not integration" mlflow_oidc_auth/tests
+coverage run -m pytest -m "not integration" mlflow_oidc_auth/tests
 coverage xml
 
 # Run a specific test file
@@ -170,6 +170,34 @@ Test configuration is in `pyproject.toml` under `[tool.pytest.ini_options]`:
 - Tests in `mlflow_oidc_auth/tests/integration/` are excluded by default (require a running server)
 - Tests marked `e2e` need Keycloak; the default tox env deselects them (see [End-to-end identity tests](#end-to-end-identity-tests))
 - Directories like `mlruns`, `htmlcov`, `__pycache__` are excluded from test discovery
+
+#### How CI runs the suite: shards
+
+The "Unit tests" workflow runs the Python suite as four parallel jobs. Each shard collects the
+whole suite and runs only the test files assigned to it (`mlflow_oidc_auth/tests/_sharding.py`);
+a file is never split across shards. To reproduce one shard locally:
+
+```bash
+tox -e py -- --shard-count=4 --shard-index=2
+# or: pytest -m "not integration and not e2e" --shard-count=4 --shard-index=2 mlflow_oidc_auth/tests
+```
+
+Use the `--opt=value` form: pytest registers these options from the test suite's `conftest.py`.
+Plain `tox -e py` (and plain `pytest`) still runs everything in one process.
+
+The final "Run Unit testing" job — the check name to gate on — passes only if the frontend job
+and every shard passed, and runs `scripts/ci/check_shards.py` to confirm the shards collected the
+same suite and together ran every collected test exactly once.
+
+Files are balanced by the per-file durations in `mlflow_oidc_auth/tests/shard_weights.json`. A
+new test file with no entry is still assigned (weighted by its test count); the weights affect
+balance, never what runs. When one shard is noticeably slower than the rest, download the
+`unit-test-shard-*` artifacts of a recent run and rebuild the weights:
+
+```bash
+# several runs' reports may be passed together to average out runner variance
+python scripts/ci/shard_weights.py path/to/unit-test-shard-*/junit.xml
+```
 
 ### Frontend Tests (Vitest)
 
@@ -213,17 +241,25 @@ tox -e integration-live
 `mlflow_oidc_auth/tests/e2e/` drives real OIDC, SAML and SCIM flows against a real **Keycloak
 26.7.4**. Nothing is mocked: the plugin is started as a real server (`mlflow server --app-name
 oidc-auth`) in a subprocess on a free loopback port, and the suite plays the browser with plain
-`httpx` — it follows redirects, fills in Keycloak's login form and submits the SAML POST-binding
+`httpx2` — it follows redirects, fills in Keycloak's login form and submits the SAML POST-binding
 form itself, with no browser engine. CI runs it on every pull request as the required job
 **E2E identity (Keycloak)** (`.github/workflows/e2e-identity.yml`), with the auth database on
 PostgreSQL.
 
 The realm is code: `scripts/e2e/keycloak/realm-mlflow-e2e.json` (realm `mlflow-e2e`, users
-`alice@example.com` / `bob@example.com` / `carol@example.com` in `mlflow-users` and
-`root@example.com` in `mlflow-admins`, an OIDC client `mlflow` and a SAML client `mlflow-saml`). It contains no keys —
+`alice@example.com` / `bob@example.com` / `carol@example.com` / `dave@example.com` in `mlflow-users` and
+`root@example.com` in `mlflow-admins`, a confidential OIDC client `mlflow`, a public OIDC client
+`mlflow-public` with PKCE S256 required, and a SAML client `mlflow-saml`). It contains no keys —
 Keycloak generates the realm keys on import — and its passwords and client secret are test
-literals. At start-up the suite rewrites both clients' redirect, ACS and SLO URLs for the port
+literals. At start-up the suite rewrites every client's redirect, ACS and SLO URLs for the port
 the app actually got.
+
+Keycloak's http listener is published on a **second port, 8081**, as well. Keycloak in dev mode
+derives the issuer from the request's host and port, and the public-client provider
+(`keycloak-public`, `"public_client": true`, no secret) needs an issuer of its own: the registry
+refuses two providers claiming one. Without the second port only the public-client test skips (or
+fails under `MLFLOW_OIDC_E2E_REQUIRE=1`). The Keycloak zip serves one http port, so that test does
+not run against it.
 
 Keycloak must serve **https** as well as http: the plugin refuses a SAML IdP whose SSO/SLO URLs
 are not https. Give it a throwaway certificate:
@@ -239,7 +275,7 @@ chmod 0644 /tmp/kc-tls/tls.key   # the container runs as a non-root user
 Start Keycloak with Docker:
 
 ```bash
-docker run --rm -d --name keycloak -p 127.0.0.1:8080:8080 -p 127.0.0.1:8443:8443 \
+docker run --rm -d --name keycloak -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8080 -p 127.0.0.1:8443:8443 \
   -v "$PWD/scripts/e2e/keycloak:/opt/keycloak/data/import:ro" \
   -v /tmp/kc-tls:/opt/keycloak/conf/tls:ro \
   -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
@@ -274,6 +310,7 @@ The default `tox` environment deselects the `e2e` marker. Without Keycloak the s
 |---|---|---|
 | `MLFLOW_OIDC_E2E_KEYCLOAK_URL` | `http://localhost:8080` | Keycloak over http: OIDC and the admin REST API |
 | `MLFLOW_OIDC_E2E_KEYCLOAK_HTTPS_URL` | `https://localhost:8443` | Keycloak over https: SAML |
+| `MLFLOW_OIDC_E2E_KEYCLOAK_PUBLIC_CLIENT_URL` | `http://localhost:8081` | Keycloak's http listener on its second published port: the public-client provider's issuer |
 | `MLFLOW_OIDC_E2E_KEYCLOAK_CA` | unset | The certificate above; verifies the https leg. Unset, verification is off — allowed only when the https URL is loopback |
 | `MLFLOW_OIDC_E2E_KEYCLOAK_ADMIN` / `_PASSWORD` | `admin` / `admin` | Keycloak bootstrap admin, for the admin REST API |
 | `MLFLOW_OIDC_E2E_REQUIRE` | unset | `1`: fail instead of skip when Keycloak is unreachable |
@@ -306,8 +343,10 @@ into it.
   end-session endpoint with its own `id_token_hint`, and `/auth/status` reports that provider.
 - *The browser never loads the React SPA*: `Browser.follow` stops at a redirect into `/oidc/ui/`
   and tests assert on its `Location`, so the suite does not need `web-react` built.
-- *SAML*: SP-initiated login with the session cookie set on the ACS response to a cookie-less
-  cross-site POST; replayed Responses refused; SP-initiated SLO revokes before redirecting and
+- *SAML*: SP-initiated login with the session cookie set on the ACS response to a cross-site
+  POST that carries only the `SameSite=None` browser-binding cookie (the harness sets
+  `SAML_LOGIN_BINDING=on`, since the app runs over loopback http); a genuine Response delivered
+  from another browser without that cookie refused (login CSRF); replayed Responses refused; SP-initiated SLO revokes before redirecting and
   completes the LogoutRequest/LogoutResponse round trip; **IdP-initiated SLO**, driven headlessly
   by submitting Keycloak's own logout page, which delivers a signed HTTP-Redirect LogoutRequest to
   `/slo/<id>` through the browser — only the session with that `SessionIndex` ends, the request

@@ -10,35 +10,54 @@ from mlflow.protos.databricks_pb2 import (
 )
 from mlflow.utils.validation import _validate_username
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import load_only, noload, selectinload
+from sqlalchemy.orm import load_only, raiseload, selectinload
 from sqlalchemy.orm import Session
-from werkzeug.security import check_password_hash, generate_password_hash
 
-from mlflow_oidc_auth.db.models import SqlAuthSession, SqlGroup, SqlUser
+from mlflow_oidc_auth.db.models import SqlAuthSession, SqlGroup, SqlUser, SqlUserIdentity, SqlUserToken
 from mlflow_oidc_auth.entities import User
 from mlflow_oidc_auth.logger import get_logger
 from mlflow_oidc_auth.config import config
-from mlflow_oidc_auth.ownership import evaluate_write
+from mlflow_oidc_auth.ownership import OwnershipDecision, evaluate_write
 from mlflow_oidc_auth.repository.utils import get_user
 
 logger = get_logger()
 
 
-def _audit_ownership_conflict(username: str, decision, written_by: Optional[str], *, allowed: bool) -> None:
+def _audit_ownership_conflict(
+    username: str,
+    decision,
+    written_by: Optional[str],
+    *,
+    allowed: bool,
+    operation: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> None:
     """Record a write that crossed ownership.
 
     Emitted in ``report`` mode as well as ``enforce`` — that is what ``report`` is *for*: the
     same event, with ``status`` saying whether it was permitted, so an operator can count what
     enforcement would refuse before enabling it.
+
+    Parameters:
+        username: The user row.
+        decision: The guard's decision.
+        written_by: The source that attempted the write.
+        allowed: Whether it went ahead.
+        operation: ``delete`` or ``create`` for those writes; omitted for an update.
+        actor: Who to name as the actor — an administrator's username, a SCIM token — when the
+            caller knows better than ``written_by``.
     """
     from mlflow_oidc_auth.audit import emit_audit_event
 
+    detail = {"owner": decision.owner, "written_by": written_by or "manual", "reason": decision.reason, "permitted": allowed}
+    if operation:
+        detail["operation"] = operation
     emit_audit_event(
         "user.ownership_conflict",
-        actor=written_by or "manual",
+        actor=actor or written_by or "manual",
         resource_type="user",
         resource_id=username,
-        detail={"owner": decision.owner, "written_by": written_by or "manual", "reason": decision.reason, "permitted": allowed},
+        detail=detail,
         status="success" if allowed else "denied",
     )
 
@@ -61,34 +80,6 @@ def _audit_sessions_revoked(username: str, count: int, reason: str) -> None:
         detail={"sessions": count, "reason": reason},
     )
 
-
-# Hash method for secrets stored in ``users.password_hash`` (issue #336).
-#
-# Nothing in this plugin stores a human-chosen password. Every value written here comes from
-# ``mlflow_oidc_auth.user.generate_token()`` — 24 characters drawn by ``secrets.choice`` from a
-# 62-character alphabet, about 143 bits of entropy — and no endpoint accepts an operator-supplied
-# password. A memory-hard KDF exists to make brute-forcing *low-entropy* human passwords
-# expensive; against 143 bits there is nothing to brute-force, so the ~48 ms that Werkzeug's
-# default scrypt costs bought no security while being paid on every basic-authenticated request.
-# Verification drops from ~47 ms to ~0.08 ms.
-#
-# Migration is handled by Werkzeug itself: the method is encoded in the stored hash and
-# ``check_password_hash`` dispatches on it, so hashes written before this change keep verifying
-# under scrypt, unchanged. Only newly written hashes use this method — a secret moves over when
-# its token is rotated. Existing hashes are deliberately never re-hashed in place: a stored
-# secret cannot be distinguished from a hypothetical operator-set password, and silently
-# re-hashing one at this cost factor would weaken it.
-#
-# This is intentionally a constant, not configuration. It is a property of what we store, not a
-# deployment choice, and the failure mode of setting it wrong is silent.
-#
-# The entropy premise is not self-enforcing: ``generate_token()`` lives in another module, and
-# shortening it or narrowing its alphabet would make this cost factor indefensible without
-# anything here changing. ``TestTokenEntropyPremise`` in
-# ``tests/repository/test_user_token_hashing.py`` pins the token's length, alphabet and resulting
-# entropy, so that change fails a test instead of passing quietly. If one of those tests has to
-# be updated, this constant has to be re-justified in the same diff.
-TOKEN_HASH_METHOD = "pbkdf2:sha256:1000"
 
 #: "Not supplied", for parameters where None is a meaningful value (clearing an external id).
 UNSET = object()
@@ -169,19 +160,53 @@ class UserRepository:
     def create(
         self,
         username: str,
-        password: str,
         display_name: str,
         is_admin: bool = False,
         is_service_account: bool = False,
+        *,
+        written_by: Optional[str] = None,
     ) -> User:
+        """Create a user row, owned by ``manual``.
+
+        **Create never re-owns (#360).** When the username already exists the create is refused
+        with ``RESOURCE_ALREADY_EXISTS`` — whoever asks, in every enforcement mode — and the
+        existing row, its owner included, is left exactly as it was. If that row is owned by a
+        source other than ``written_by`` the attempt is also recorded as a refused
+        ``user.ownership_conflict`` (``operation: create``). This does not depend on the caller
+        checking first: the login path refuses a foreign username earlier (#318), but a repository
+        that would silently hand an existing row to its caller would be one missing check away from
+        an ownership takeover.
+
+        Together with the guard on :meth:`delete`, this is what stops delete-then-create from
+        laundering ownership: a source that may not write a row may not delete it either, so it
+        cannot clear the name for a create that would come back ``manual``.
+
+        Every row created here is ``manual``, including one a login creates (``docs/scim.md``:
+        a first SSO sign-in does not make the provider the owner). A directory creates its rows
+        through :meth:`SqlAlchemyStore.create_scim_user`, which writes ``scim``.
+
+        Parameters:
+            username: Identity key; folded to lower case.
+            display_name: Display name.
+            is_admin: Administrator flag.
+            is_service_account: Service-account flag.
+            written_by: The source asking, for the audit record of a refused create.
+
+        Returns:
+            User: The new user.
+
+        Raises:
+            MlflowException: ``RESOURCE_ALREADY_EXISTS`` if the username exists.
+        """
         username = normalize_username(username)
         _validate_username(username)
-        pwhash = generate_password_hash(password, method=TOKEN_HASH_METHOD)
         with self._Session(read_only=False) as session:
+            existing = session.query(SqlUser.managed_by, SqlUser.is_admin).filter(SqlUser.username == username).one_or_none()
+            if existing is not None:
+                self._refuse_create(username, (existing[0], bool(existing[1])), written_by)
             try:
                 u = SqlUser(
                     username=username,
-                    password_hash=pwhash,
                     display_name=display_name,
                     is_admin=is_admin,
                     is_service_account=is_service_account,
@@ -190,7 +215,57 @@ class UserRepository:
                 session.flush()
                 return u.to_mlflow_entity()
             except IntegrityError as e:
-                raise MlflowException(f"User '{username}' already exists: {e}", RESOURCE_ALREADY_EXISTS) from e
+                raise MlflowException(f"User '{username}' already exists", RESOURCE_ALREADY_EXISTS) from e
+
+    @staticmethod
+    def _refuse_create(username: str, existing, written_by: Optional[str]) -> None:
+        owner, is_admin = existing
+        decision = evaluate_write(
+            owner,
+            written_by,
+            enforcement=config.MANAGED_BY_ENFORCEMENT,
+            fields={"created"},
+            target_is_admin=is_admin,
+        )
+        if decision.conflict:
+            # Refused whatever the mode says: a create over an existing row is not a write that
+            # ``report`` could let through, because it would replace the row rather than change it.
+            refused = OwnershipDecision(
+                allowed=False,
+                conflict=True,
+                owner=decision.owner,
+                reason=f"{written_by or 'manual'!r} may not create over a row owned by {decision.owner!r}; create never re-owns",
+            )
+            _audit_ownership_conflict(username, refused, written_by, allowed=False, operation="create")
+        raise MlflowException(f"User '{username}' already exists", RESOURCE_ALREADY_EXISTS)
+
+    def provision_workload_identity(
+        self,
+        username: str,
+        display_name: str,
+        provider_id: str,
+        subject: str,
+        managed_by: str,
+    ) -> User:
+        """Atomically create a non-admin service account and bind its external identity."""
+        username = normalize_username(username)
+        _validate_username(username)
+        with self._Session(read_only=False) as session:
+            try:
+                user = SqlUser(
+                    username=username,
+                    display_name=display_name,
+                    is_admin=False,
+                    is_service_account=True,
+                    managed_by=managed_by,
+                )
+                session.add(user)
+                session.flush()
+                session.add(SqlUserIdentity(provider_id=provider_id, subject=subject, user_id=user.id))
+                session.flush()
+                return user.to_mlflow_entity()
+            except IntegrityError as exc:
+                raise MlflowException(f"Workload user '{username}' or its external identity already exists", RESOURCE_ALREADY_EXISTS) from exc
 
     def get(self, username: str) -> User:
         username = normalize_username(username)
@@ -223,7 +298,6 @@ class UserRepository:
                         SqlUser.id,
                         SqlUser.username,
                         SqlUser.display_name,
-                        SqlUser.password_expiration,
                         SqlUser.is_admin,
                         SqlUser.is_service_account,
                         # Widening the existing select rather than adding a query: this row is
@@ -233,12 +307,16 @@ class UserRepository:
                         SqlUser.managed_by,
                     ),
                     selectinload(SqlUser.groups).load_only(SqlGroup.id, SqlGroup.group_name),
-                    noload(SqlUser.experiment_permissions),
-                    noload(SqlUser.registered_model_permissions),
-                    noload(SqlUser.scorer_permissions),
-                    noload(SqlUser.gateway_endpoint_permissions),
-                    noload(SqlUser.gateway_model_definition_permissions),
-                    noload(SqlUser.gateway_secret_permissions),
+                    # The User entity below is built by hand with these lists hardcoded to [],
+                    # so nothing here should ever touch the ORM relationships. raiseload makes an
+                    # accidental access fail loudly instead of silently loading them (which would
+                    # add a query) or silently returning empty results.
+                    raiseload(SqlUser.experiment_permissions),
+                    raiseload(SqlUser.registered_model_permissions),
+                    raiseload(SqlUser.scorer_permissions),
+                    raiseload(SqlUser.gateway_endpoint_permissions),
+                    raiseload(SqlUser.gateway_model_definition_permissions),
+                    raiseload(SqlUser.gateway_secret_permissions),
                 )
                 .filter(SqlUser.username == username)
                 .one_or_none()
@@ -250,8 +328,6 @@ class UserRepository:
                 id_=u.id,
                 username=u.username,
                 display_name=u.display_name,
-                password_hash="REDACTED",
-                password_expiration=u.password_expiration,
                 is_admin=u.is_admin,
                 is_service_account=u.is_service_account,
                 active=u.active,
@@ -290,8 +366,8 @@ class UserRepository:
         """The fields a write would actually change, for the ownership guard.
 
         A supplied value equal to the stored one is not a change: a login that re-asserts an
-        unchanged admin flag is not writing anything. A new ``password`` or an expiry is always a
-        change — secrets are not compared.
+        unchanged admin flag is not writing anything. Revoking the user's tokens is always a
+        change, recorded as ``password`` as it was before tokens moved to their own table.
         """
         changed = set()
         for name in ("is_admin", "is_service_account", "active", "managed_by", "display_name"):
@@ -301,15 +377,13 @@ class UserRepository:
         external_id = supplied.get("external_id", UNSET)
         if external_id is not UNSET and (external_id or None) != user.external_id:
             changed.add("external_id")
-        if supplied.get("password") is not None or supplied.get("password_expiration") is not None:
+        if supplied.get("revoke_tokens"):
             changed.add("password")
         return changed
 
     def update(
         self,
         username: str,
-        password: Optional[str] = None,
-        password_expiration: Optional[datetime] = None,
         is_admin: Optional[bool] = None,
         is_service_account: Optional[bool] = None,
         active: Optional[bool] = None,
@@ -318,32 +392,17 @@ class UserRepository:
         admin_override: bool = False,
         display_name: Optional[str] = None,
         external_id=UNSET,
+        revoke_tokens: bool = False,
     ) -> User:
         """Update the supplied fields of a user, leaving omitted ones untouched.
 
-        ``None`` means "not supplied" for every parameter but one: the corresponding column is
-        left as it is. The defaults for the two flags previously read ``False`` while the guards
-        below tested for ``None``, so a caller that omitted them silently cleared ``is_admin``
-        and ``is_service_account`` instead of preserving them (issue #338).
-
-        The exception is ``password_expiration``, because expiry is a property of the *secret*
-        rather than of the user:
-
-        * When ``password`` is supplied, the secret is being replaced, so it gets a fresh
-          lifetime — exactly the one passed in, with ``None`` meaning "does not expire". The
-          previous value is never inherited. Inheriting it meant that rotating an already-expired
-          token produced a new token that was rejected on its first use, because ``authenticate``
-          checks expiry before comparing the hash.
-        * When ``password`` is not supplied, the expiry is only changed if one was passed.
-
-        A consequence worth stating: an expiry cannot be cleared without also rotating the
-        secret. That is deliberate — extending the life of a credential that has already been
-        issued should require issuing a new one.
+        ``None`` means "not supplied": the corresponding column is left as it is. The defaults for
+        the two flags previously read ``False`` while the guards below tested for ``None``, so a
+        caller that omitted them silently cleared ``is_admin`` and ``is_service_account`` instead
+        of preserving them (issue #338).
 
         Parameters:
             username: Identity key of the user to update.
-            password: New secret. Hashed with :data:`TOKEN_HASH_METHOD`.
-            password_expiration: Expiry for the stored secret. See the semantics above.
             is_admin: New administrator flag.
             is_service_account: New service-account flag.
             active: Whether the account may authenticate. Setting it False is how a directory
@@ -355,6 +414,8 @@ class UserRepository:
                 always permitted, always audited.
             display_name: New display name.
             external_id: New external id; omit to leave it, None to clear it. Unique when present.
+            revoke_tokens: Delete every access token of the user (issue #189). What deactivation
+                does to the user's API credentials, in the same transaction as the rest.
 
         Returns:
             User: The updated user entity.
@@ -366,8 +427,6 @@ class UserRepository:
                 is written in any of these cases: every field, the session revocation and the
                 credential change share one transaction.
         """
-        from werkzeug.security import generate_password_hash
-
         username = normalize_username(username)
         sessions_revoked = 0
         permitted_conflict = None
@@ -383,8 +442,7 @@ class UserRepository:
                 admin_override=admin_override,
                 fields=self._changed_fields(
                     user,
-                    password=password,
-                    password_expiration=password_expiration,
+                    revoke_tokens=revoke_tokens,
                     is_admin=is_admin,
                     is_service_account=is_service_account,
                     active=active,
@@ -409,12 +467,6 @@ class UserRepository:
                     INVALID_PARAMETER_VALUE,
                 )
 
-            if password is not None:
-                user.password_hash = generate_password_hash(password, method=TOKEN_HASH_METHOD)
-                # A new secret gets the lifetime it was issued with, never the old one's.
-                user.password_expiration = password_expiration
-            elif password_expiration is not None:
-                user.password_expiration = password_expiration
             # Deactivating or demoting the last active admin locks everyone out just as surely
             # as deleting them, so both go through the same guard — checked before the change
             # is applied, since afterwards the user would no longer count as an active admin
@@ -453,6 +505,14 @@ class UserRepository:
                 session.flush()
             except IntegrityError as e:
                 raise MlflowException(f"external id {external_id!r} is already bound to another user", RESOURCE_ALREADY_EXISTS) from e
+            if revoke_tokens:
+                # After the users row has been written and flushed, not before: issuing a token
+                # holds that row locked (``UserTokenRepository._lock_user``), so the write above
+                # waits for an in-flight issue to commit, and this DELETE — a fresh statement —
+                # then sees its token. Deleting first would miss it and leave a token that comes
+                # back to life on reactivation (#189 review).
+                session.query(SqlUserToken).filter(SqlUserToken.user_id == user.id).delete(synchronize_session=False)
+                session.flush()
             entity = user.to_mlflow_entity()
 
         # Past the ``with``: the transaction has committed, so the events are true when written.
@@ -462,8 +522,92 @@ class UserRepository:
             _audit_sessions_revoked(username, sessions_revoked, "user_deactivated")
         return entity
 
-    def delete(self, username: str, before_cascade: Optional[Callable] = None, after_cascade: Optional[Callable] = None) -> None:
-        """Hard-delete a user and every row that references them.
+    @staticmethod
+    def _reown_memberships(session, user, managed_by: str) -> list:
+        """Set every membership of ``user`` to ``managed_by`` inside ``session``.
+
+        Returns ``(group_name, previous_owner)`` for each row that changed.
+        """
+        from mlflow_oidc_auth.db.models import SqlUserGroup
+
+        changed = []
+        rows = (
+            session.query(SqlUserGroup, SqlGroup.group_name)
+            .outerjoin(SqlGroup, SqlGroup.id == SqlUserGroup.group_id)
+            .filter(SqlUserGroup.user_id == user.id)
+            .order_by(SqlUserGroup.id)
+            .all()
+        )
+        for row, group_name in rows:
+            previous = row.managed_by or "manual"
+            if previous != managed_by:
+                row.managed_by = managed_by
+                changed.append((group_name if group_name is not None else str(row.group_id), previous))
+        return changed
+
+    def hand_over(self, username: str, managed_by: str, *, memberships: bool = False, actor: Optional[str] = None) -> dict:
+        """Break glass: hand a user row — and optionally every membership of it — to ``managed_by``.
+
+        One transaction for both halves, so a failure re-owning the memberships leaves the user row
+        as it was too: an operator repairing a lockout must never be left with half a repair and no
+        record of it. An explicit administrator action, so always permitted; the cross-source
+        override is recorded as ``user.ownership_conflict`` once the change has committed.
+
+        Parameters:
+            username: The user.
+            managed_by: The new owner.
+            memberships: Whether to re-own the user's group memberships too.
+            actor: The administrator, for the audit record.
+
+        Returns:
+            ``{"previous": <old owner>, "memberships": [(group, previous_owner), ...]}``.
+
+        Raises:
+            MlflowException: ``RESOURCE_DOES_NOT_EXIST`` for an unknown user. Nothing is written.
+        """
+        username = normalize_username(username)
+        with self._Session(read_only=False) as session:
+            user = get_user(session, username)
+            previous = user.managed_by
+            decision = None
+            if (previous or "manual") != managed_by:
+                # Only an actual change of the user row's owner is an override worth recording; a
+                # call that only re-owns memberships (the row already has this owner) is not.
+                decision = evaluate_write(
+                    previous,
+                    "manual",
+                    enforcement=config.MANAGED_BY_ENFORCEMENT,
+                    admin_override=True,
+                    fields={"managed_by"},
+                    target_is_admin=bool(user.is_admin),
+                )
+                user.managed_by = managed_by
+            changed = self._reown_memberships(session, user, managed_by) if memberships else []
+            session.flush()
+        if decision is not None and decision.conflict:
+            _audit_ownership_conflict(username, decision, "manual", allowed=True, actor=actor)
+        return {"previous": previous, "memberships": changed}
+
+    def delete(
+        self,
+        username: str,
+        before_cascade: Optional[Callable] = None,
+        after_cascade: Optional[Callable] = None,
+        *,
+        written_by: Optional[str] = None,
+        admin_override: bool = False,
+        actor: Optional[str] = None,
+    ) -> None:
+        """Hard-delete a user and every row that references them, through the ownership guard.
+
+        **Ownership (#360).** Deleting a row is the largest write there is, so it goes through
+        :func:`evaluate_write` like :meth:`update` does, before anything else — before the
+        last-admin check, before the orphan hooks. A source that may not write a row may not delete
+        it: under ``enforce`` the delete is refused (``INVALID_PARAMETER_VALUE``) and audited as a
+        refused ``user.ownership_conflict`` (``operation: delete``); under ``report`` it proceeds and
+        the conflict is recorded once the delete has committed. ``admin_override`` is the break
+        glass: always permitted, always recorded. A directory may not delete a hand-made
+        administrator under ``enforce``.
 
         Parameters:
             username: The user.
@@ -476,13 +620,40 @@ class UserRepository:
                 savepoint it opens is nested inside an already-begun transaction (on SQLite a
                 savepoint opened before any write would itself begin, and its release commit,
                 the transaction).
+            written_by: The source deleting the row. None is an unattributed write, treated as
+                ``manual``.
+            admin_override: Break glass for a row another source owns.
+            actor: Who to name in the audit event (an administrator, a SCIM token).
+
+        Raises:
+            MlflowException: ``RESOURCE_DOES_NOT_EXIST`` for an unknown user;
+                ``INVALID_PARAMETER_VALUE`` when the ownership guard refuses; ``INVALID_STATE`` for
+                the last active administrator. Nothing is written in any of these cases.
         """
         username = normalize_username(username)
         deleted_sessions = 0
+        permitted_conflict = None
         with self._Session(read_only=False) as session:
             user = get_user(session, username)
             if user is None:
                 raise MlflowException(f"User '{username}' not found.")
+
+            decision = evaluate_write(
+                getattr(user, "managed_by", None),
+                written_by,
+                enforcement=config.MANAGED_BY_ENFORCEMENT,
+                admin_override=admin_override,
+                fields={"deleted"},
+                target_is_admin=bool(user.is_admin),
+            )
+            if decision.conflict and not decision.allowed:
+                _audit_ownership_conflict(username, decision, written_by, allowed=False, operation="delete", actor=actor)
+                raise MlflowException(
+                    f"User '{username}' is managed by {decision.owner!r} and cannot be deleted by {written_by or 'manual'!r}: {decision.reason}.",
+                    INVALID_PARAMETER_VALUE,
+                )
+            if decision.conflict:
+                permitted_conflict = decision
 
             self._assert_not_last_active_admin(session, user, "delete")
 
@@ -558,6 +729,10 @@ class UserRepository:
             # Group memberships
             session.query(SqlUserGroup).filter(SqlUserGroup.user_id == user_id).delete(synchronize_session=False)
 
+            # Access tokens (#189). The foreign key cascades on delete; they are removed explicitly
+            # anyway, like every other dependent here, so the delete does not rest on the pragma.
+            session.query(SqlUserToken).filter(SqlUserToken.user_id == user_id).delete(synchronize_session=False)
+
             session.delete(user)
             session.flush()
 
@@ -565,22 +740,7 @@ class UserRepository:
                 after_cascade(session)
 
         # Emitted after the commit, for the same reason as in ``update``.
+        if permitted_conflict is not None:
+            _audit_ownership_conflict(username, permitted_conflict, written_by, allowed=True, operation="delete", actor=actor)
         if deleted_sessions:
             _audit_sessions_revoked(username, deleted_sessions, "user_deleted")
-
-    def authenticate(self, username: str, password: str) -> bool:
-        username = normalize_username(username)
-        with self._Session() as session:
-            try:
-                user = get_user(session, username)
-                expiration = user.password_expiration
-                if expiration is not None:
-                    # Normalize into a local, so the comparison does not mark the
-                    # persistent user row dirty and flush an UPDATE on every login.
-                    if expiration.tzinfo is None:
-                        expiration = expiration.replace(tzinfo=timezone.utc)
-                    if expiration < datetime.now(timezone.utc):
-                        return False
-                return check_password_hash(getattr(user, "password_hash"), password)
-            except MlflowException:
-                return False

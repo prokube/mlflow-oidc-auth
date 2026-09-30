@@ -37,7 +37,9 @@ from datetime import datetime, timedelta, timezone
 from typing import List
 
 import pytest
-from authlib.jose import JsonWebKey, jwt
+
+from mlflow_oidc_auth.tests.token_helpers import issue_token
+from mlflow_oidc_auth.tests.jose_helpers import encode_jwt, generate_rsa_key
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
@@ -45,10 +47,12 @@ from starlette.middleware.sessions import SessionMiddleware
 import mlflow_oidc_auth.auth as auth_module
 import mlflow_oidc_auth.store as store_module
 from mlflow_oidc_auth.middleware import AuthMiddleware
+from mlflow_oidc_auth.provider_registry import ProviderConfig, RegistryLoadResult
+from mlflow_oidc_auth.spiffe import parse_spiffe_id
+from mlflow_oidc_auth.workload import parse_workload_identity
 
 from .conftest import QueryCounter
 
-BENCH_PASSWORD = "bench-password"  # not a credential: only ever seeded into a tmp_path database
 PROTECTED_PATH = "/bench/protected"
 UNPROTECTED_PATH = "/health/bench"
 LOGIN_PATH = "/login/bench"
@@ -56,13 +60,21 @@ LOGIN_PATH = "/login/bench"
 
 @pytest.fixture
 def auth_user(store):
-    """A user with a real password hash and a handful of groups."""
+    """A user with a handful of groups and several access tokens."""
     username = "baseline@example.com"
-    store.create_user(username, BENCH_PASSWORD, "Baseline User")
+    store.create_user(username, "Baseline User")
     groups = [f"baseline-group-{i}" for i in range(4)]
     store.populate_groups(groups)
     store.set_user_groups(username, groups)
     return username
+
+
+@pytest.fixture
+def auth_token(store, auth_user):
+    """One of the user's tokens. The user holds others, which the lookup must not touch (#189)."""
+    for name in ("other-1", "other-2", "other-3"):
+        issue_token(store, auth_user, name=name)
+    return issue_token(store, auth_user, name="bench")
 
 
 @pytest.fixture
@@ -87,9 +99,9 @@ def bearer_token(monkeypatch):
     what a warm production process does too, since JWKS is cached for
     ``OIDC_JWKS_CACHE_TTL_SECONDS``.
     """
-    key = JsonWebKey.generate_key("RSA", 2048, is_private=True)
-    private = key.as_dict(is_private=True)
-    public = key.as_dict(is_private=False)
+    key = generate_rsa_key()
+    private = key.as_dict(private=True)
+    public = key.as_dict(private=False)
     kid = public.get("kid") or key.thumbprint()
     public["kid"] = kid
     private["kid"] = kid
@@ -100,7 +112,7 @@ def bearer_token(monkeypatch):
     def mint(username: str) -> str:
         now = int(time.time())
         claims = {"email": username, "name": username, "iat": now, "exp": now + 3600}
-        return jwt.encode({"alg": "RS256", "kid": kid}, claims, private).decode("utf-8")
+        return encode_jwt({"alg": "RS256", "kid": kid}, claims, private)
 
     return mint
 
@@ -185,6 +197,109 @@ class TestAuthPathQueryBudget:
 
         assert counts == [2, 2, 2], counter.report()
 
+    def test_spiffe_workload_steady_state_issues_two_queries(self, client, counter, bound_store, monkeypatch):
+        """Allowlist checks and deterministic identity mapping add no steady-state query."""
+        spiffe_id = "spiffe://prokube.internal/ns/ml-team/sa/training-pipeline"
+        identity = parse_spiffe_id(spiffe_id, "prokube.internal")
+        provider = ProviderConfig(
+            id="spire",
+            type="spiffe",
+            interactive=False,
+            provisioning="jit",
+            group_sync="none",
+            admin_source="none",
+            issuer="https://spire.invalid",
+            discovery_url="https://spire.invalid/.well-known/openid-configuration",
+            audience="mlflow-api",
+            trust_domain="prokube.internal",
+            spiffe_id_allowlist=(spiffe_id,),
+        )
+        bound_store.provision_workload_identity(identity.username, spiffe_id, provider.id, spiffe_id, "spiffe:spire")
+
+        key = generate_rsa_key()
+        private = key.as_dict(private=True)
+        public = key.as_dict(private=False)
+        kid = public.get("kid") or key.thumbprint()
+        private["kid"] = public["kid"] = kid
+        public["use"] = "sig"
+        monkeypatch.setattr(auth_module.config, "AUTH_PROVIDERS", RegistryLoadResult(providers=[provider], source="env"))
+        monkeypatch.setattr(auth_module, "_get_provider_jwks", lambda selected, force_refresh=False: {"keys": [public]})
+        now = int(time.time())
+        token = encode_jwt(
+            {"alg": "RS256", "kid": kid},
+            {"iss": provider.issuer, "aud": provider.audience, "sub": spiffe_id, "iat": now, "exp": now + 300},
+            private,
+        )
+
+        counts = _count_requests(counter, lambda: client.get(PROTECTED_PATH, headers={"Authorization": f"Bearer {token}"}))
+
+        assert counts == [2, 2, 2], counter.report()
+
+    def test_brokered_workload_steady_state_issues_two_queries(self, client, counter, bound_store, monkeypatch):
+        """Client allowlisting and subject binding add no steady-state query."""
+        provider = ProviderConfig(
+            id="keycloak-workloads",
+            type="workload",
+            interactive=False,
+            provisioning="jit",
+            group_sync="none",
+            admin_source="none",
+            issuer="https://keycloak.invalid/realms/workloads",
+            discovery_url=("https://keycloak.invalid/realms/workloads/.well-known/" "openid-configuration"),
+            audience="mlflow-api",
+            workload_client_id_claim="azp",
+            workload_client_id_allowlist=("mlflow-team-reader",),
+        )
+        claims = {
+            "iss": provider.issuer,
+            "aud": provider.audience,
+            "sub": "service-account-subject",
+            "azp": "mlflow-team-reader",
+        }
+        identity = parse_workload_identity(
+            claims,
+            provider.issuer,
+            provider.workload_client_id_claim,
+            provider.workload_client_id_allowlist,
+        )
+        bound_store.provision_workload_identity(
+            identity.username,
+            identity.client_id,
+            provider.id,
+            identity.fingerprint,
+            "workload:keycloak-workloads",
+        )
+
+        key = generate_rsa_key()
+        private = key.as_dict(private=True)
+        public = key.as_dict(private=False)
+        kid = public.get("kid") or key.thumbprint()
+        private["kid"] = public["kid"] = kid
+        public["use"] = "sig"
+        monkeypatch.setattr(
+            auth_module.config,
+            "AUTH_PROVIDERS",
+            RegistryLoadResult(providers=[provider], source="env"),
+        )
+        monkeypatch.setattr(
+            auth_module,
+            "_get_provider_jwks",
+            lambda selected, force_refresh=False: {"keys": [public]},
+        )
+        now = int(time.time())
+        token = encode_jwt(
+            {"alg": "RS256", "kid": kid},
+            {**claims, "iat": now, "exp": now + 300},
+            private,
+        )
+
+        counts = _count_requests(
+            counter,
+            lambda: client.get(PROTECTED_PATH, headers={"Authorization": f"Bearer {token}"}),
+        )
+
+        assert counts == [2, 2, 2], counter.report()
+
     def test_bearer_with_provisioning_enabled_costs_one_extra_query(self, client, counter, auth_user, bearer_token, monkeypatch):
         """``OIDC_PROVISION_ON_BEARER_AUTH`` adds a ``has_user`` check to *every* bearer
         request, not only the first — the guard runs before it can decide to do nothing.
@@ -201,13 +316,29 @@ class TestAuthPathQueryBudget:
 
         assert counts == [3, 3, 3], counter.report()
 
-    def test_basic_authenticated_request_issues_three_queries(self, client, counter, auth_user):
-        """Basic auth pays one extra statement to load the password hash before the admin check."""
-        credentials = base64.b64encode(f"{auth_user}:{BENCH_PASSWORD}".encode()).decode()
+    def test_basic_authenticated_request_issues_three_queries(self, client, counter, auth_user, auth_token):
+        """Basic auth pays one extra statement to load the token by its prefix before the admin
+        check — one, however many tokens the user holds (#189).
+
+        The first use of a token in a minute also records ``last_used_at``: one UPDATE, at most
+        once a minute per token (``LAST_USED_RESOLUTION_SECONDS``), pinned separately below. The
+        warm-up request here pays it, so the three measured requests are the steady state.
+        """
+        credentials = base64.b64encode(f"{auth_user}:{auth_token}".encode()).decode()
+        headers = {"Authorization": f"Basic {credentials}"}
+        assert client.get(PROTECTED_PATH, headers=headers).status_code == 200
+
+        counts = _count_requests(counter, lambda: client.get(PROTECTED_PATH, headers=headers))
+
+        assert counts == [3, 3, 3], counter.report()
+
+    def test_first_use_of_a_token_in_a_minute_records_it_once(self, client, counter, auth_user, auth_token):
+        """``last_used_at`` costs one UPDATE on the first request, and none on the next ones."""
+        credentials = base64.b64encode(f"{auth_user}:{auth_token}".encode()).decode()
 
         counts = _count_requests(counter, lambda: client.get(PROTECTED_PATH, headers={"Authorization": f"Basic {credentials}"}))
 
-        assert counts == [3, 3, 3], counter.report()
+        assert counts == [4, 3, 3], counter.report()
 
 
 class TestAuthPathDenialCosts:
@@ -236,7 +367,7 @@ class TestAuthPathDenialCosts:
         assert response.status_code == 401
         assert counter.count == 0, counter.report()
 
-    def test_wrong_basic_password_is_denied_after_one_query(self, client, counter, auth_user):
+    def test_wrong_basic_password_is_denied_after_one_query(self, client, counter, auth_user, auth_token):
         """Basic auth must load the hash to compare it, but must not go on to the admin check."""
         credentials = base64.b64encode(f"{auth_user}:wrong-password".encode()).decode()
         counter.reset()
@@ -275,7 +406,7 @@ class TestAdminStatusLookup:
         """The 2 statements must not become 2 + G. ``selectinload`` batches; a lazy load
         would not, and that is the regression this guards."""
         username = f"g{n_groups}@example.com"
-        store.create_user(username, BENCH_PASSWORD, username)
+        store.create_user(username, username)
         if n_groups:
             groups = [f"cg{n_groups}-{i}" for i in range(n_groups)]
             store.populate_groups(groups)
