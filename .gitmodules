@@ -1,0 +1,4 @@
+[submodule "mlflow-upstream"]
+	path = mlflow-upstream
+	url = https://github.com/mlflow/mlflow.git
+	shallow = true
