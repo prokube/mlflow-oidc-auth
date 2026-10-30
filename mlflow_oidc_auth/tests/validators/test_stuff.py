@@ -65,6 +65,40 @@ class TestValidateGatewayProxy:
     than a requirement.
     """
 
+    @pytest.fixture(autouse=True)
+    def deployments_target(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Configure a target so the listing GET is actually proxied, unless a test removes it."""
+        monkeypatch.setenv("MLFLOW_DEPLOYMENTS_TARGET", "http://gateway.example:7000")
+
+    def test_get_listing_allowed_without_deployments_target(self, flask_app: Flask, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No target: MLflow answers an empty list itself, so a user with no grants is allowed."""
+        monkeypatch.delenv("MLFLOW_DEPLOYMENTS_TARGET")
+        with (
+            flask_app.test_request_context("/?gateway_path=api/2.0/endpoints/", method="GET"),
+            patch("mlflow_oidc_auth.store.store") as mock_store,
+        ):
+            mock_store.list_gateway_endpoint_permissions.return_value = []
+            assert validate_gateway_proxy("nobody") is True
+        mock_store.list_gateway_endpoint_permissions.assert_not_called()
+
+    def test_named_endpoint_still_checked_without_deployments_target(self, flask_app: Flask, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The no-target allowance covers only the listing, never a named endpoint."""
+        monkeypatch.delenv("MLFLOW_DEPLOYMENTS_TARGET")
+        with (
+            flask_app.test_request_context("/?gateway_path=gateway/locked-ep/invocations", method="GET"),
+            patch("mlflow_oidc_auth.utils.permissions.can_use_gateway_endpoint", return_value=False) as mock_use,
+        ):
+            assert validate_gateway_proxy("bob") is False
+        mock_use.assert_called_once_with("locked-ep", "bob")
+
+    def test_post_denied_without_deployments_target(self, flask_app: Flask, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("MLFLOW_DEPLOYMENTS_TARGET")
+        with (
+            flask_app.test_request_context("/", method="POST", json={"gateway_path": "gateway/locked-ep/invocations"}),
+            patch("mlflow_oidc_auth.utils.permissions.can_update_gateway_endpoint", return_value=False),
+        ):
+            assert validate_gateway_proxy("bob") is False
+
     def test_post_resolves_the_endpoint_from_gateway_path(self, flask_app: Flask) -> None:
         """POST authorizes the endpoint named inside gateway_path."""
         with (

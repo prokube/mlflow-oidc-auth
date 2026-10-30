@@ -4,6 +4,7 @@ import re
 from typing import Sequence
 
 from flask import request
+from mlflow.environment_variables import MLFLOW_DEPLOYMENTS_TARGET
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
 from mlflow.server.handlers import _get_tracking_store
@@ -177,6 +178,11 @@ def validate_gateway_proxy(username: str) -> bool:
         # That exposure is pre-existing and tracked separately.
         if gateway_name:
             allowed = check(str(gateway_name), username)
+        elif not MLFLOW_DEPLOYMENTS_TARGET.get():
+            # With no deployments target MLflow answers {"endpoints": []} without proxying,
+            # so there is nothing to protect. Denying it breaks every non-admin runs page,
+            # which always fetches this listing (EvaluationCreatePromptRunModal on mount).
+            allowed = True
         else:
             # Fallback: check if user has any gateway endpoint with use
             perms = store.list_gateway_endpoint_permissions(username)
