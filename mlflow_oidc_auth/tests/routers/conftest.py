@@ -282,6 +282,7 @@ def mock_oauth():
         }
     )
     oidc_mock.server_metadata = {"end_session_endpoint": "https://provider.com/logout"}
+    oidc_mock.load_server_metadata = AsyncMock(return_value=oidc_mock.server_metadata)
 
     oauth_mock.oidc = oidc_mock
     return oauth_mock

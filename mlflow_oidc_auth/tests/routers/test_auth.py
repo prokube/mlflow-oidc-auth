@@ -217,6 +217,7 @@ class TestLogoutEndpoint:
 
         mock_oauth = MagicMock()
         mock_oauth.oidc.server_metadata = {}  # No end_session_endpoint
+        mock_oauth.oidc.load_server_metadata = AsyncMock(return_value={})
 
         with patch("mlflow_oidc_auth.routers.auth.oauth", mock_oauth):
             result = await logout(request)
@@ -230,13 +231,27 @@ class TestLogoutEndpoint:
             assert "/oidc/ui/auth" in result.headers["location"]
 
     @pytest.mark.asyncio
+    async def test_logout_loads_deferred_provider_metadata(self, mock_request_with_session):
+        request = mock_request_with_session({"username": "test@example.com", "authenticated": True})
+        mock_oauth = MagicMock()
+        mock_oauth.oidc.server_metadata = {}
+        mock_oauth.oidc.load_server_metadata = AsyncMock(return_value={"end_session_endpoint": "https://provider.com/logout"})
+
+        with patch("mlflow_oidc_auth.routers.auth.oauth", mock_oauth):
+            result = await logout(request)
+
+        mock_oauth.oidc.load_server_metadata.assert_awaited_once_with()
+        assert result.headers["location"].startswith("https://provider.com/logout?")
+
+    @pytest.mark.asyncio
     async def test_logout_exception_handling(self, mock_request_with_session):
         """Test logout exception handling."""
         request = mock_request_with_session({"username": "test@example.com", "authenticated": True})
 
         # Simulate exception during logout
         with patch("mlflow_oidc_auth.routers.auth.oauth") as mock_oauth:
-            mock_oauth.oidc.server_metadata = None  # This will cause an exception
+            mock_oauth.oidc.server_metadata = None
+            mock_oauth.oidc.load_server_metadata = AsyncMock(side_effect=RuntimeError("discovery unavailable"))
 
             result = await logout(request)
 

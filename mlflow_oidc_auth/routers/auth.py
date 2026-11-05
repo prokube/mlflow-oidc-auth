@@ -952,9 +952,14 @@ async def logout(request: Request):
             logout_url = await _named_provider_end_session_url(request, provider_id, session_tokens)
             return RedirectResponse(url=logout_url or _build_ui_url(request, "/auth"), status_code=302)
 
-        # Check if OIDC provider supports logout
-        if hasattr(oauth.oidc, "server_metadata"):
-            metadata = getattr(oauth.oidc, "server_metadata", {})
+        # Authlib can defer discovery until metadata is requested. Load it here
+        # so logout does not silently skip the provider's end-session endpoint.
+        metadata = getattr(oauth.oidc, "server_metadata", None) or {}
+        if not metadata.get("end_session_endpoint"):
+            load_metadata = getattr(oauth.oidc, "load_server_metadata", None)
+            if load_metadata is not None:
+                metadata = await _maybe_await(load_metadata()) or metadata
+        if metadata:
             end_session_endpoint = metadata.get("end_session_endpoint")
 
             if end_session_endpoint:
