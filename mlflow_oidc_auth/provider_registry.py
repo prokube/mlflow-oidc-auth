@@ -171,6 +171,22 @@ class ProviderConfig:
         issuer: Expected ``iss``, when known.
         discovery_url: OIDC discovery document, for ``oidc`` providers.
         client_id: OAuth client id, for ``oidc`` providers.
+        public_client: ``oidc`` only. The client was issued without a client secret, so PKCE
+            authenticates its token exchange instead (#300). Opt-in: a missing secret on a
+            provider that does not declare this is a configuration error, not a public client.
+            False by default; for the synthesised ``default`` provider it comes from
+            ``OIDC_PUBLIC_CLIENT``.
+        userinfo_groups: ``oidc`` only. Whether the groups and workspace claims may be read from
+            the provider's UserInfo endpoint when the ID token lacks them. They decide access,
+            administrator status and workspace membership, so this is opt-in: by default only
+            identity claims (username, email, display name) are completed from UserInfo. False by
+            default; for the synthesised ``default`` provider it comes from ``OIDC_USERINFO_GROUPS``.
+        bearer_adopts_unbound_accounts: ``oidc`` only, and not ``default``. Whether this provider's
+            bearer tokens may reach an existing non-admin account that no identity is bound to —
+            one this provider's bearer provisioning created before identities were bound, or one
+            an administrator created — and bind it to the token's ``(provider, sub)`` on first use,
+            after which only that identity reaches it. Off by default: such an account could also
+            be a human's who has not signed in since identities were recorded.
         jwks_inline: Key set written into configuration, for a cluster whose JWKS cannot be
             fetched. The only mode that needs no network at all.
         jwks_uri: Key set URL, when it is known and discovery is not readable.
@@ -218,6 +234,11 @@ class ProviderConfig:
     issuer: Optional[str] = None
     discovery_url: Optional[str] = None
     client_id: Optional[str] = None
+    # Opt-in (#300): registered without a client secret, PKCE authenticating the token exchange.
+    public_client: bool = False
+    # Opt-in: groups and workspace claims may come from UserInfo when the ID token lacks them.
+    userinfo_groups: bool = False
+    bearer_adopts_unbound_accounts: bool = False
     # Kubernetes service-account providers (#314). A cluster's JWKS is often not anonymously
     # readable and often unreachable from wherever MLflow runs, so the keys can come from
     # discovery, from configuration, or from the API server using the pod's own credentials.
@@ -376,6 +397,41 @@ def _validate(entry: Dict[str, Any], index: int, seen_ids: set) -> Tuple[Optiona
         # tokens it would not — or, worse, would once that type learned to.
         errors.append(f"{label}: 'allow_tokens_without_expiry' applies only to a token provider ({', '.join(TOKEN_PROVIDER_TYPES)}), not to {provider_type!r}")
 
+    public_client = entry.get("public_client", False)
+    if not isinstance(public_client, bool):
+        # Strict rather than truthy, as for allow_tokens_without_expiry: the string "false" is
+        # truthy, and reading it as true would register a client without its secret.
+        errors.append(f"{label}: 'public_client' must be true or false, got {public_client!r}")
+    elif public_client and provider_type != "oidc":
+        # Only an OIDC provider has an OAuth client to register. Refused rather than ignored: an
+        # operator who wrote it believes it changes something.
+        errors.append(f"{label}: 'public_client' applies only to an 'oidc' provider, not to {provider_type!r}")
+
+    userinfo_groups = entry.get("userinfo_groups", False)
+    if not isinstance(userinfo_groups, bool):
+        # Strict rather than truthy: the string "false" is truthy, and reading it as true would let
+        # UserInfo decide group membership and administrator status.
+        errors.append(f"{label}: 'userinfo_groups' must be true or false, got {userinfo_groups!r}")
+    elif userinfo_groups and provider_type != "oidc":
+        # Only an OIDC provider has a UserInfo endpoint. Refused rather than ignored: an operator
+        # who wrote it believes it changes something.
+        errors.append(f"{label}: 'userinfo_groups' applies only to an 'oidc' provider, not to {provider_type!r}")
+
+    if isinstance(entry.get("id"), str) and entry["id"].strip() in ("internal", "kubernetes"):
+        # Reserved: a service account's sign-in source names its provider by id, and these two
+        # mean "issued tokens only" and "a Kubernetes account from before sources were recorded".
+        errors.append(f"{label}: provider id {entry['id'].strip()!r} is reserved")
+
+    bearer_adopts_unbound_accounts = entry.get("bearer_adopts_unbound_accounts", False)
+    if not isinstance(bearer_adopts_unbound_accounts, bool):
+        errors.append(f"{label}: 'bearer_adopts_unbound_accounts' must be true or false, got {bearer_adopts_unbound_accounts!r}")
+    elif bearer_adopts_unbound_accounts and provider_type != "oidc":
+        # Only an OIDC provider's tokens take the bearer path that consults it (a Kubernetes token
+        # reaches its own service accounts; SAML has no bearer tokens).
+        errors.append(f"{label}: 'bearer_adopts_unbound_accounts' applies only to an 'oidc' provider, not to {provider_type!r}")
+    elif bearer_adopts_unbound_accounts and entry.get("id") == DEFAULT_PROVIDER_ID:
+        errors.append(f"{label}: 'bearer_adopts_unbound_accounts' does not apply to the 'default' provider, which reaches unbound accounts already")
+
     allowed_email_domains = _as_tuple(entry.get("allowed_email_domains"))
     if identity_binding == "email" and not allowed_email_domains:
         errors.append(
@@ -484,6 +540,9 @@ def _validate(entry: Dict[str, Any], index: int, seen_ids: set) -> Tuple[Optiona
             issuer=issuer.strip() if isinstance(issuer, str) else None,
             discovery_url=discovery_url.strip() if isinstance(discovery_url, str) else None,
             client_id=client_id.strip() if isinstance(client_id, str) else None,
+            public_client=public_client is True,
+            userinfo_groups=userinfo_groups is True,
+            bearer_adopts_unbound_accounts=bearer_adopts_unbound_accounts is True,
             **saml_fields,
         ),
         [],
@@ -795,16 +854,20 @@ def _fetch_idp_metadata(url: str, idp_entity_id: str) -> Dict[str, Any]:
     import requests
     from onelogin.saml2.idp_metadata_parser import OneLogin_Saml2_IdPMetadataParser
 
-    try:
-        response = requests.get(url, timeout=SAML_METADATA_TIMEOUT_SECONDS, allow_redirects=False, stream=True)
-    except requests.RequestException as exc:
-        raise ValueError(f"the request failed ({type(exc).__name__})")
-    try:
-        if response.status_code != 200:
-            raise ValueError(f"the server answered HTTP {response.status_code}")
-        body = response.raw.read(SAML_METADATA_MAX_BYTES + 1, decode_content=True)
-    finally:
-        response.close()
+    from mlflow_oidc_auth.http_client import system_trust_session
+
+    # The operating system's trust store, as for every other outbound call (see http_client).
+    with system_trust_session() as session:
+        try:
+            response = session.get(url, timeout=SAML_METADATA_TIMEOUT_SECONDS, allow_redirects=False, stream=True)
+        except requests.RequestException as exc:
+            raise ValueError(f"the request failed ({type(exc).__name__})")
+        try:
+            if response.status_code != 200:
+                raise ValueError(f"the server answered HTTP {response.status_code}")
+            body = response.raw.read(SAML_METADATA_MAX_BYTES + 1, decode_content=True)
+        finally:
+            response.close()
     if len(body) > SAML_METADATA_MAX_BYTES:
         raise ValueError("the document is larger than 1 MiB")
 
@@ -1082,6 +1145,12 @@ def _legacy_entry(app_config: Any) -> Dict[str, Any]:
         # Never true for the synthesised provider: there is no flat variable to opt in with,
         # and a token without ``exp`` is refused like any other (#356).
         "allow_tokens_without_expiry": False,
+        # OIDC_PUBLIC_CLIENT (#300). ``is True`` rather than truthiness: the config layer parses
+        # it as a boolean, and anything else must not register a client without its secret.
+        "public_client": getattr(app_config, "OIDC_PUBLIC_CLIENT", False) is True,
+        # OIDC_USERINFO_GROUPS. ``is True`` for the same reason: anything but a real boolean must
+        # not let UserInfo decide group membership.
+        "userinfo_groups": getattr(app_config, "OIDC_USERINFO_GROUPS", False) is True,
     }
 
 
@@ -1252,6 +1321,8 @@ def _legacy_providers(app_config: Any) -> List[ProviderConfig]:
             issuer=entry["issuer"],
             discovery_url=entry["discovery_url"],
             client_id=entry["client_id"],
+            public_client=entry["public_client"],
+            userinfo_groups=entry["userinfo_groups"],
             allow_tokens_without_expiry=False,
         )
     ]

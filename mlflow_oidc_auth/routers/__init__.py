@@ -21,7 +21,7 @@ from mlflow_oidc_auth.routers.registered_model_permissions import (
     registered_model_permissions_router,
 )
 from mlflow_oidc_auth.routers.saml import saml_router
-from mlflow_oidc_auth.routers.scim import scim_router, scim_tokens_router
+from mlflow_oidc_auth.routers.scim import scim_admin_router, scim_router, scim_tokens_router
 from mlflow_oidc_auth.routers.scorers_permissions import scorers_permissions_router
 from mlflow_oidc_auth.routers.gateway_endpoint_permissions import (
     gateway_endpoint_permissions_router,
@@ -33,6 +33,11 @@ from mlflow_oidc_auth.routers.gateway_model_definition_permissions import (
     gateway_model_definition_permissions_router,
 )
 from mlflow_oidc_auth.routers.health import health_check_router
+from mlflow_oidc_auth.routers.mcp_server_permissions import (
+    group_mcp_server_permissions_router,
+    mcp_server_permissions_router,
+    user_mcp_server_permissions_router,
+)
 from mlflow_oidc_auth.routers.trash import trash_router
 from mlflow_oidc_auth.routers.ui import ui_router
 from mlflow_oidc_auth.routers.user_permissions import user_permissions_router
@@ -42,6 +47,7 @@ from mlflow_oidc_auth.routers.workspace_permissions import workspace_permissions
 from mlflow_oidc_auth.routers.workspace_regex_permissions import (
     workspace_regex_permissions_router,
 )
+from mlflow_oidc_auth.routers.workspace_rules import workspace_rules_router
 
 __all__ = [
     "ajax_alias_router",
@@ -51,6 +57,7 @@ __all__ = [
     "prompt_permissions_router",
     "registered_model_permissions_router",
     "saml_router",
+    "scim_admin_router",
     "scim_router",
     "scim_tokens_router",
     "scorers_permissions_router",
@@ -58,6 +65,9 @@ __all__ = [
     "gateway_secret_permissions_router",
     "gateway_model_definition_permissions_router",
     "health_check_router",
+    "mcp_server_permissions_router",
+    "user_mcp_server_permissions_router",
+    "group_mcp_server_permissions_router",
     "trash_router",
     "ui_router",
     "user_permissions_router",
@@ -65,6 +75,7 @@ __all__ = [
     "webhook_router",
     "workspace_permissions_router",
     "workspace_regex_permissions_router",
+    "workspace_rules_router",
 ]
 
 
@@ -178,12 +189,18 @@ def get_all_routers() -> List[APIRouter]:
     return [
         auth_router,
         experiment_permissions_router,
+        # Ahead of the group and user routers, so that none of their routes, such as
+        # ``/{group_name}/users``, claims an MCP server path whose slug is ``users`` or ``groups``.
+        mcp_server_permissions_router,
+        user_mcp_server_permissions_router,
+        group_mcp_server_permissions_router,
         group_permissions_router,
         prompt_permissions_router,
         registered_model_permissions_router,
         saml_router,
         scim_router,
         scim_tokens_router,
+        scim_admin_router,
         scorers_permissions_router,
         gateway_endpoint_permissions_router,
         gateway_secret_permissions_router,
@@ -194,4 +211,6 @@ def get_all_routers() -> List[APIRouter]:
         user_permissions_router,
         users_router,
         webhook_router,
+        # Always registered: it answers 404 itself while MLFLOW_ENABLE_WORKSPACES is off (#418).
+        workspace_rules_router,
     ]

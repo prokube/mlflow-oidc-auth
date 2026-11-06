@@ -13,8 +13,6 @@ from click.testing import CliRunner
 
 from mlflow_oidc_auth.db.cli import commands
 
-PASSWORD = "prune-password"  # not a credential: only ever seeded into a tmp_path database
-
 
 def _in(seconds: int) -> datetime:
     return datetime.now(timezone.utc) + timedelta(seconds=seconds)
@@ -27,7 +25,7 @@ def db(tmp_path):
     url = f"sqlite:///{tmp_path / 'auth.db'}"
     store = SqlAlchemyStore()
     store.init_db(url)
-    store.create_user("alice@example.com", PASSWORD, "Alice")
+    store.create_user("alice@example.com", "Alice")
     yield store, url
     store.engine.dispose()
 
@@ -76,3 +74,58 @@ class TestPruneSessions:
 
         assert "1 expired session(s) would be deleted" in output
         assert store.auth_session_repo.delete_expired() == 1, "the row is still there"
+
+
+class TestPruneScimActivity:
+    """SCIM activity (#325) older than ``SCIM_ACTIVITY_RETENTION_DAYS`` goes with the same sweep."""
+
+    def _seed(self, store, days_ago: int):
+        store.record_scim_activity(
+            token_id=1,
+            token_name="entra",
+            method="GET",
+            path="/Users",
+            resource_id=None,
+            status=200,
+            outcome="ok",
+            error=None,
+            duration_ms=1,
+            at=(datetime.now(timezone.utc) - timedelta(days=days_ago)).replace(tzinfo=None),
+        )
+
+    def test_old_activity_is_deleted_and_recent_kept(self, db, monkeypatch):
+        from mlflow_oidc_auth.config import config
+
+        monkeypatch.setattr(config, "SCIM_ACTIVITY_RETENTION_DAYS", 30, raising=False)
+        store, url = db
+        self._seed(store, 31)
+        self._seed(store, 1)
+
+        output = _run(url)
+
+        assert "deleted 1 SCIM activity row(s) older than 30 day(s)" in output
+        assert len(store.list_scim_activity(limit=200)) == 1
+
+    def test_dry_run_reports_and_keeps(self, db, monkeypatch):
+        from mlflow_oidc_auth.config import config
+
+        monkeypatch.setattr(config, "SCIM_ACTIVITY_RETENTION_DAYS", 30, raising=False)
+        store, url = db
+        self._seed(store, 31)
+
+        output = _run(url, "--dry-run")
+
+        assert "1 SCIM activity row(s) older than 30 day(s) would be deleted" in output
+        assert len(store.list_scim_activity(limit=200)) == 1
+
+    def test_zero_retention_keeps_everything(self, db, monkeypatch):
+        from mlflow_oidc_auth.config import config
+
+        monkeypatch.setattr(config, "SCIM_ACTIVITY_RETENTION_DAYS", 0, raising=False)
+        store, url = db
+        self._seed(store, 400)
+
+        output = _run(url)
+
+        assert "SCIM activity" not in output
+        assert len(store.list_scim_activity(limit=200)) == 1

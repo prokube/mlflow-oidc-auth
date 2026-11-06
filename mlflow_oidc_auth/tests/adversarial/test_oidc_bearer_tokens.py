@@ -97,7 +97,7 @@ class TestTokensWithoutAnExpiry:
     def test_the_refusal_is_for_the_missing_claim(self, verify, trusted):
         """Not incidentally for something else about the token: the control below is identical
         but for ``exp``."""
-        from authlib.jose.errors import MissingClaimError
+        from joserfc.errors import MissingClaimError
 
         with pytest.raises(MissingClaimError, match="exp"):
             verify(self._without_exp(trusted))
@@ -244,7 +244,7 @@ class TestEndToEndThroughTheMiddleware:
 
         store = SqlAlchemyStore()
         store.init_db(f"sqlite:///{tmp_path / 'auth.db'}")
-        store.create_user(USERNAME, "token", "Adversary Suite", is_admin=True)
+        store.create_user(USERNAME, "Adversary Suite", is_admin=True)
         previous = object.__getattribute__(store_module.store, "_instance")
         object.__setattr__(store_module.store, "_instance", store)
 

@@ -21,6 +21,7 @@ from mlflow_oidc_auth.repository.registered_model_permission_group import (
     RegisteredModelPermissionGroupRepository,
 )
 from mlflow_oidc_auth.repository.user import UserRepository
+from mlflow_oidc_auth.repository.user_token import UserTokenRepository
 from mlflow_oidc_auth.repository.auth_session import AuthSessionRepository
 from mlflow_oidc_auth.repository.auth_state import AuthStateRepository
 from mlflow_oidc_auth.repository.user_identity import UserIdentityRepository
@@ -31,9 +32,11 @@ from mlflow_oidc_auth.repository.experiment_permission_regex_group import (
     ExperimentPermissionGroupRegexRepository,
 )
 from mlflow_oidc_auth.repository.registered_model_permission_regex import (
+    PromptPermissionRegexRepository,
     RegisteredModelPermissionRegexRepository,
 )
 from mlflow_oidc_auth.repository.registered_model_permission_regex_group import (
+    PromptGroupRegexPermissionRepository,
     RegisteredModelGroupRegexPermissionRepository,
 )
 
@@ -87,6 +90,11 @@ from mlflow_oidc_auth.repository.gateway_model_definition_group_regex_permission
     GatewayModelDefinitionPermissionGroupRegexRepository,
 )
 
+from mlflow_oidc_auth.repository.mcp_server_permissions import (
+    MCPServerGroupPermissionRepository,
+    MCPServerPermissionRepository,
+)
+
 from mlflow_oidc_auth.repository.workspace_permission import (
     WorkspacePermissionRepository,
 )
@@ -112,6 +120,7 @@ __all__ = [
     "RegisteredModelPermissionRepository",
     "RegisteredModelPermissionGroupRepository",
     "UserRepository",
+    "UserTokenRepository",
     "UserIdentityRepository",
     "AuthSessionRepository",
     "AuthStateRepository",
@@ -119,6 +128,8 @@ __all__ = [
     "ExperimentPermissionGroupRegexRepository",
     "RegisteredModelPermissionRegexRepository",
     "RegisteredModelGroupRegexPermissionRepository",
+    "PromptPermissionRegexRepository",
+    "PromptGroupRegexPermissionRepository",
     "ScorerPermissionRepository",
     "ScorerPermissionGroupRepository",
     "ScorerPermissionRegexRepository",
@@ -135,6 +146,8 @@ __all__ = [
     "GatewayModelDefinitionPermissionRegexRepository",
     "GatewayModelDefinitionGroupPermissionRepository",
     "GatewayModelDefinitionPermissionGroupRegexRepository",
+    "MCPServerPermissionRepository",
+    "MCPServerGroupPermissionRepository",
     "WorkspacePermissionRepository",
     "WorkspaceGroupPermissionRepository",
     "WorkspaceRegexPermissionRepository",

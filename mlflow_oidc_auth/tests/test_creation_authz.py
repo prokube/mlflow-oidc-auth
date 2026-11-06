@@ -1,5 +1,6 @@
 """Tests for RESTRICT_RESOURCE_CREATION authorization on experiment/model creation (#247, #202)."""
 
+from itertools import count
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -9,10 +10,12 @@ from mlflow_oidc_auth.config import config
 from mlflow_oidc_auth.models import PermissionResult
 from mlflow_oidc_auth.permissions import EDIT, MANAGE, NO_PERMISSIONS, READ
 
+_regex_ids = count(1)
+
 
 def _regex(pattern, permission, priority=1):
-    """A stand-in for a stored regex-permission row (has .regex/.permission/.priority)."""
-    return SimpleNamespace(regex=pattern, permission=permission, priority=priority)
+    """A stand-in for a stored regex-permission row (has .regex/.permission/.priority/.id)."""
+    return SimpleNamespace(regex=pattern, permission=permission, priority=priority, id=next(_regex_ids))
 
 
 class TestCreateValidatorsAreNoOpWhenDisabled:
@@ -46,7 +49,7 @@ class TestCreateValidatorsWhenEnabled:
 
         with patch("mlflow_oidc_auth.validators.experiment.config") as cfg:
             cfg.RESTRICT_RESOURCE_CREATION = True
-            with patch("mlflow_oidc_auth.validators.experiment.get_request_param", return_value="proj-exp"):
+            with patch("mlflow_oidc_auth.validators.experiment.get_request_param_values", return_value=["proj-exp"]):
                 with patch(
                     "mlflow_oidc_auth.validators.experiment.effective_new_experiment_permission",
                     return_value=PermissionResult(perm, "regex"),
@@ -60,7 +63,7 @@ class TestCreateValidatorsWhenEnabled:
 
         with patch("mlflow_oidc_auth.validators.registered_model.config") as cfg:
             cfg.RESTRICT_RESOURCE_CREATION = True
-            with patch("mlflow_oidc_auth.validators.registered_model.get_model_name", return_value="proj-model"):
+            with patch("mlflow_oidc_auth.validators.registered_model.get_model_names", return_value=["proj-model"]):
                 with patch(
                     "mlflow_oidc_auth.validators.registered_model.effective_new_registered_model_permission",
                     return_value=PermissionResult(perm, "regex"),
@@ -202,7 +205,7 @@ class TestDefaultPermissionActuallyGatesCreation:
             patch.object(config, "DEFAULT_MLFLOW_PERMISSION", "NO_PERMISSIONS"),
             patch.object(config, "MLFLOW_ENABLE_WORKSPACES", False),
             patch.object(config, "PERMISSION_SOURCE_ORDER", ["regex", "group-regex"]),
-            patch("mlflow_oidc_auth.validators.experiment.get_request_param", return_value="unowned-exp"),
+            patch("mlflow_oidc_auth.validators.experiment.get_request_param_values", return_value=["unowned-exp"]),
             patch("mlflow_oidc_auth.utils.permissions.store") as store,
         ):
             store.list_experiment_regex_permissions.return_value = []
@@ -266,7 +269,7 @@ class TestUserAssignedRegexGrantsCreation:
             patch.object(config, "DEFAULT_MLFLOW_PERMISSION", "NO_PERMISSIONS"),
             patch.object(config, "MLFLOW_ENABLE_WORKSPACES", False),
             patch.object(config, "PERMISSION_SOURCE_ORDER", ["regex", "group-regex"]),
-            patch("mlflow_oidc_auth.validators.experiment.get_request_param", return_value="alice/exp-1"),
+            patch("mlflow_oidc_auth.validators.experiment.get_request_param_values", return_value=["alice/exp-1"]),
             patch("mlflow_oidc_auth.utils.permissions.store") as store,
         ):
             store.list_experiment_regex_permissions.return_value = [_regex(r"^alice/.*", "EDIT")]

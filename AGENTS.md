@@ -5,9 +5,11 @@ truth; `CLAUDE.md` and `.github/copilot-instructions.md` point here. Nested `AGE
 `mlflow_oidc_auth/` and `web-react/` add subsystem detail and win over this one for files beneath
 them.
 
-**What this project is:** an MLflow authentication and authorization plugin. It adds OIDC login,
-RBAC over users/groups, and per-resource permissions to an MLflow tracking server. Almost every
-change here is a change to a security boundary — treat it accordingly.
+**What this project is:** MLflow Access Control (package `mlflow-oidc-auth`), an MLflow
+authentication and authorization plugin. It adds single sign-on (OIDC, SAML 2.0), SCIM
+provisioning, service accounts, RBAC over users/groups, and per-resource permissions to an MLflow
+tracking server. Almost every change here is a change to a security boundary — treat it
+accordingly.
 
 ---
 
@@ -65,7 +67,7 @@ permission check.
 | Constraint | What it means in practice |
 |---|---|
 | **Plugin boundary** | This controls auth and authz only. MLflow core behavior cannot be changed — if a fix requires it, the answer is a workaround here or an upstream issue there. |
-| **MLflow floor `>=3.14.0`** | Declared in `pyproject.toml`. Workspace/organization features originated in 3.10; 3.14.0 is the supported floor. |
+| **MLflow floor `>=3.16.0`** | Declared in `pyproject.toml`. Workspace/organization features originated in 3.10; 3.16.0 is the supported floor (the MCP server registry needs 3.15+, the assistant routes and current job signatures 3.16). |
 | **Upstream workspace API is unstable** | The workspace RPCs this plugin proxies were recorded during the workspace milestone as `PUBLIC_UNDOCUMENTED` — not part of MLflow's committed public surface, so they can change in a minor release. Re-verify against the pinned MLflow before relying on one; treat a break there as expected, not exceptional. |
 | **Workspace lifecycle is not ours** | Workspace CRUD proxies to MLflow's `/api/3.0/mlflow/workspaces`. Never write to MLflow's store directly — that skips its validation and constraints. |
 | **Workspaces are opt-in** | `MLFLOW_ENABLE_WORKSPACES` defaults to false and gates all workspace behavior. An existing deployment that changes no configuration must be unaffected by anything you do here. |
@@ -77,7 +79,10 @@ permission check.
 1. **Store singleton.** `from mlflow_oidc_auth.store import store`. Never construct a second store.
 2. **New APIs are FastAPI.** Add a router under `mlflow_oidc_auth/routers/`, register it in
    `routers/__init__.py`, and gate it with `Depends()` from `dependencies.py`.
-3. **Middleware order is load-bearing.** Proxy → Auth → Session, set in `app.py`. Do not reorder.
+3. **Middleware order is load-bearing.** Outermost first: Proxy → Session → WorkspaceContext → Auth →
+   Permission, set in `add_middleware_stack()` in `app.py`. Proxy is outermost so a forwarded
+   prefix is known before Auth and Permission decide on the routed path; Session wraps Auth,
+   which reads the session. Do not reorder.
 4. **Flask hooks stay put** unless the task is specifically about them. They are what keeps the
    MLflow UI and API working.
 5. **Deny by default.** A missing permission grant means no access. Never add a fallback that
@@ -160,8 +165,6 @@ these rules, stop and surface it verbatim to the human.
 - Disable, skip, or `xfail` a security test.
 - `git push --force`, push to `main`, or amend a commit you did not create.
 
-`.claude/settings.json` denies the file reads above at the tool layer, so they fail rather than
-depending on this file being read. Deny rules there beat everything, including hooks.
 
 ### The rule that governs agentic CI
 

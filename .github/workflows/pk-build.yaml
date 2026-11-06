@@ -4,184 +4,69 @@ on:
   pull_request:
   workflow_dispatch:
   push:
+    branches-ignore:
+      - main
+      - pk-build
     tags:
       - 'v*'
 
-env:
-  IMAGE_NAME: "mlflow-oidc-auth"
-  # RFC-006: only release-tag builds go to releases; everything else goes to development.
-  RELEASE_IMAGE_PUSH_PATH: "europe-west3-docker.pkg.dev/prokube/releases"
-  DEV_IMAGE_PUSH_PATH: "europe-west3-docker.pkg.dev/prokube/development"
-  # Must match the upstream tag pk-build is based on; stamped into the wheel metadata.
-  MLFLOW_OIDC_AUTH_VERSION: "7.19.0"
-  # MLflow v3.16.1
-  MLFLOW_COMMIT: 32792afe5b0183fce10532d3a023f5cfa8612d09
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
+  # Fork PRs run without secrets; first-party branch/manual and validated tag runs may publish.
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Validate release tag
-        id: validate-tag-push
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select image destination and tags
+        id: image
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
-          # vA.B.C_vX.Y.Z: A.B.C is the upstream mlflow-oidc-auth version, X.Y.Z ours
-          if [[ ! "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+_v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
-            echo "::error::Release tag must match vA.B.C_vX.Y.Z or vA.B.C_vX.Y.Z-rcN"
-            exit 1
-          fi
-          git fetch origin pk-main
-          if ! git branch -r --contains HEAD | grep -q 'origin/pk-main'; then
-            echo "::error::Tag is not on pk-main branch. Stopping the workflow."
-            exit 1
-          fi
-
-      - name: Setup build dependencies
-        run: |
-          set -euo pipefail
-          # ubuntu-latest comes with pip and npm
-          npm install -g yarn
-          pip install uv --break-system-packages
-
-      - name: Restore MLflow build cache
-        id: cache-mlflow
-        uses: actions/cache/restore@v4
-        with:
-          path: dist/mlflow-*.tar.gz
-          key: mlflow-build-${{ env.MLFLOW_COMMIT }}
-
-      - name: Restore MLflow JS node_modules cache
-        if: steps.cache-mlflow.outputs.cache-hit != 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: mlflow-upstream/mlflow/server/js/node_modules
-          key: mlflow-js-${{ hashFiles('mlflow-upstream/mlflow/server/js/yarn.lock') }}
-
-      - name: Restore web-react node_modules cache
-        uses: actions/cache/restore@v4
-        with:
-          path: web-react/node_modules
-          key: web-react-${{ hashFiles('web-react/yarn.lock') }}
-
-      - name: Build MLflow from source
-        id: build-mlflow
-        if: steps.cache-mlflow.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-
-          git init mlflow-upstream
-          cd mlflow-upstream
-          git remote add origin https://github.com/mlflow/mlflow.git
-          git fetch --depth=1 --filter=blob:none origin ${{ env.MLFLOW_COMMIT }}
-          git checkout FETCH_HEAD
-
-          cd mlflow/server/js
-          yarn install --immutable
-          yarn build
-
-          cd ../../..
-          uv sync --frozen --no-install-project --no-cache
-          uv build
-          mkdir -p ../dist
-          cp dist/mlflow-*.tar.gz ../dist/
-
-      - name: Build mlflow-oidc-auth
-        id: build-oidc-auth
-        run: |
-          set -euo pipefail
-          cd web-react
-          yarn install --immutable
-          yarn build
-          cd ..
-          uv sync --no-install-project --no-cache
-          uv build
-          test -f "dist/mlflow_oidc_auth-${MLFLOW_OIDC_AUTH_VERSION}-py3-none-any.whl"
-
+          export OIDC_VERSION="$(make --silent print-oidc-version)"
+          bash scripts/image-tags.sh >> "$GITHUB_OUTPUT"
+      - name: Require release source on pk-main
+        id: release-source
+        if: steps.image.outputs.release == 'true'
+        run: git merge-base --is-ancestor HEAD origin/pk-main
+      - name: Build image
+        run: make build-image IMAGE=mlflow-oidc-auth:ci
+      - name: Verify installed versions
+        run: make smoke-image IMAGE=mlflow-oidc-auth:ci
       - name: Auth GCloud CLI
-        uses: google-github-actions/auth@v2
+        if: github.repository == 'prokube/mlflow-oidc-auth' && github.event_name != 'pull_request' && steps.image.outputs.publish == 'true'
+        uses: google-github-actions/auth@v3
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
       - name: Docker Login to Google Artifact Registry
-        uses: docker/login-action@v3
+        if: github.repository == 'prokube/mlflow-oidc-auth' && github.event_name != 'pull_request' && steps.image.outputs.publish == 'true'
+        uses: docker/login-action@v4
         with:
           registry: europe-west3-docker.pkg.dev
           username: _json_key
           password: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Build and push dev docker image
-        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-        id: docker-build-dev
+      - name: Publish image
+        if: github.repository == 'prokube/mlflow-oidc-auth' && github.event_name != 'pull_request' && steps.image.outputs.publish == 'true'
         env:
-          BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+          IMAGE_TAG: ${{ steps.image.outputs.image_tag }}
+          COMMIT_TAG: ${{ steps.image.outputs.commit_tag }}
         run: |
           set -euo pipefail
-          # Build image tag
-          COMMIT_SHORT=$(git rev-parse --short HEAD)
-
-          # Sanitize branch name (replace / and other invalid chars with -)
-          BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
-          
-          # Generate datetime stamp
-          DATETIME=$(date -u +%Y%m%d-%H%M%S)
-
-          IMAGE_TAG=${{ env.DEV_IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${BRANCH_NAME}-${DATETIME}
-          COMMIT_TAG=${{ env.DEV_IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${COMMIT_SHORT}
-          docker build --platform linux/amd64 -t $IMAGE_TAG .
-          docker tag $IMAGE_TAG $COMMIT_TAG
-          docker push $IMAGE_TAG
-          docker push $COMMIT_TAG
-          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "commit_tag=$COMMIT_TAG" >> $GITHUB_OUTPUT
-
-      - name: Comment on PR with image tags
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh pr comment ${{ github.event.pull_request.number }} --body "**Build succeeded!**
-
-          **Image tags:**
-          \`\`\`
-          ${{ steps.docker-build-dev.outputs.image_tag }}
-          ${{ steps.docker-build-dev.outputs.commit_tag }}
-          \`\`\`"
-
-      - name: Build and push release docker image if pushed tag is on pk-main branch
-        id: docker-build-prod
-        if: github.event_name == 'push' && steps.validate-tag-push.outcome == 'success'
-        run: |
-          set -euo pipefail
-          # RFC-006: exactly one tag (the git tag) per release image, never latest
-          IMAGE_TAG=${{ env.RELEASE_IMAGE_PUSH_PATH }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-          docker build --platform linux/amd64 -t $IMAGE_TAG .
-          docker push $IMAGE_TAG
-
-      - name: Save MLflow build cache
-        if: always() && steps.build-mlflow.outcome == 'success'
-        uses: actions/cache/save@v4
-        with:
-          path: dist/mlflow-*.tar.gz
-          key: mlflow-build-${{ env.MLFLOW_COMMIT }}
-
-      - name: Save MLflow JS node_modules cache
-        if: always() && steps.build-mlflow.outcome == 'success'
-        uses: actions/cache/save@v4
-        with:
-          path: mlflow-upstream/mlflow/server/js/node_modules
-          key: mlflow-js-${{ hashFiles('mlflow-upstream/mlflow/server/js/yarn.lock') }}
-
-      - name: Save web-react node_modules cache
-        if: always() && steps.build-oidc-auth.outcome == 'success'
-        uses: actions/cache/save@v4
-        with:
-          path: web-react/node_modules
-          key: web-react-${{ hashFiles('web-react/yarn.lock') }}
+          docker tag mlflow-oidc-auth:ci "$IMAGE_TAG"
+          docker push "$IMAGE_TAG"
+          if [[ -n "$COMMIT_TAG" ]]; then
+            docker tag mlflow-oidc-auth:ci "$COMMIT_TAG"
+            docker push "$COMMIT_TAG"
+          fi
+          docker image inspect "$IMAGE_TAG" --format '{{index .RepoDigests 0}}' >> "$GITHUB_STEP_SUMMARY"

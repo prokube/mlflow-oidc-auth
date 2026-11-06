@@ -108,6 +108,17 @@ class AppConfig:
             raise ValueError(f"Invalid SESSION_COOKIE_SAMESITE value: '{_session_cookie_samesite}'")
         self.SESSION_COOKIE_SAMESITE = _session_cookie_samesite
         self.SESSION_COOKIE_SECURE = config_manager.get_bool("SESSION_COOKIE_SECURE", default=False)
+        # Binds a SAML login to the browser that started it with a nonce cookie (issue #374).
+        # ``auto`` (default): on exactly when SESSION_COOKIE_SECURE is — the cookie is
+        # ``SameSite=None; Secure``, which a browser only returns over https. ``on`` forces it
+        # without secure session cookies, for http test rigs; ``off`` disables it. Raises on
+        # anything else, like SESSION_COOKIE_SAMESITE: a typo in a CSRF switch must not
+        # silently pick a mode.
+        _saml_login_binding = str(config_manager.get("SAML_LOGIN_BINDING", "auto") or "auto").strip().lower()
+        if _saml_login_binding not in self.SAML_LOGIN_BINDING_MODES:
+            # The value itself is not repeated: config values may come from a secrets provider.
+            raise ValueError("Invalid SAML_LOGIN_BINDING value (expected one of auto, on, off)")
+        self.SAML_LOGIN_BINDING = _saml_login_binding
 
         # Database settings (sensitive)
         self.OIDC_USERS_DB_URI = config_manager.get("OIDC_USERS_DB_URI", "sqlite:///auth.db")
@@ -154,6 +165,16 @@ class AppConfig:
         # login, and the secure direction is the safe one to fall back to.
         _code_challenge = config_manager.get("OIDC_CODE_CHALLENGE", "S256")
         self.OIDC_CODE_CHALLENGE = self._parse_code_challenge(_code_challenge)
+        # Declares the flat-configured client a *public* client: one the provider issued without a
+        # client secret, whose token exchange PKCE authenticates instead. Opt-in rather than
+        # inferred from a missing OIDC_CLIENT_SECRET, so a secret that failed to load from a
+        # secrets manager is reported as missing instead of silently turning the deployment into a
+        # public client. Requires PKCE, and refuses a client secret configured alongside it.
+        self.OIDC_PUBLIC_CLIENT = config_manager.get_bool("OIDC_PUBLIC_CLIENT", default=False)
+        # Whether the flat-configured provider's groups and workspace claims may be read from its
+        # UserInfo endpoint when the ID token lacks them. Off by default: those claims decide
+        # access and administrator status. Identity claims are completed from UserInfo either way.
+        self.OIDC_USERINFO_GROUPS = config_manager.get_bool("OIDC_USERINFO_GROUPS", default=False)
 
         # Permission cache settings
         # Whether a write from one source may overwrite a row another source owns (#319).
@@ -163,13 +184,19 @@ class AppConfig:
         self.MANAGED_BY_ENFORCEMENT = parse_enforcement(config_manager.get("MANAGED_BY_ENFORCEMENT", "report"))
 
         self.PERMISSION_CACHE_TTL_SECONDS = config_manager.get_int("PERMISSION_CACHE_TTL_SECONDS", default=30)
+        # Entries in the permission resolution cache (issue #456). Each entry is one small
+        # (user, resource, decision) tuple; a single list page can fill hundreds of slots.
+        self.PERMISSION_CACHE_MAX_SIZE = config_manager.get_positive_int("PERMISSION_CACHE_MAX_SIZE", default=10000)
 
         # username source
         self.OIDC_USERNAME_FIELD = config_manager.get_list("OIDC_USERNAME_FIELD", default=["email", "preferred_username"])
         self.OIDC_DISPLAY_NAME_FIELD = config_manager.get_list("OIDC_DISPLAY_NAME_FIELD", default=["name"])
 
-        # Group settings
+        # Group settings. OIDC_GROUP_NAME is exact names; OIDC_GROUP_NAME_PATTERN is opt-in
+        # shell-style patterns (issue #78), kept separate so a name containing a pattern
+        # character keeps meaning only itself.
         self.OIDC_GROUP_NAME = config_manager.get_list("OIDC_GROUP_NAME", default=["mlflow"])
+        self.OIDC_GROUP_NAME_PATTERN = config_manager.get_list("OIDC_GROUP_NAME_PATTERN", default=[])
         self.OIDC_ADMIN_GROUP_NAME = config_manager.get_list("OIDC_ADMIN_GROUP_NAME", default=["mlflow-admin"])
         self.OIDC_GROUP_DETECTION_PLUGIN = config_manager.get("OIDC_GROUP_DETECTION_PLUGIN")
         # Optional issuer (iss) validation for JWTs. When set, tokens must carry a matching
@@ -195,6 +222,10 @@ class AppConfig:
         # any 401 response, so expired sessions trigger the IdP redirect flow instead
         # of leaving the user staring at empty SPA pages.
         self.EXTEND_MLFLOW_REAUTH = config_manager.get_bool("EXTEND_MLFLOW_REAUTH", default=True)
+        # Inject a small script into MLflow's index.html that sends MLflow's built-in admin
+        # pages (#/admin, #/admin/users/<u>, #/admin/ws, #/account) to the plugin's UI. Those
+        # pages target MLflow's basic-auth RBAC APIs, which this plugin does not implement.
+        self.EXTEND_MLFLOW_REDIRECT_ADMIN = config_manager.get_bool("EXTEND_MLFLOW_REDIRECT_ADMIN", default=True)
         self.DEFAULT_LANDING_PAGE_IS_PERMISSIONS = config_manager.get_bool("DEFAULT_LANDING_PAGE_IS_PERMISSIONS", default=True)
         self.AUTOMATIC_LOGIN_REDIRECT = config_manager.get_bool("AUTOMATIC_LOGIN_REDIRECT", default=False)
 
@@ -205,8 +236,12 @@ class AppConfig:
         self.MLFLOW_ENABLE_WORKSPACES = config_manager.get_bool("MLFLOW_ENABLE_WORKSPACES", default=False)
 
         # Workspace cache settings
-        self.WORKSPACE_CACHE_MAX_SIZE = config_manager.get_int("WORKSPACE_CACHE_MAX_SIZE", default=1024)
+        self.WORKSPACE_CACHE_MAX_SIZE = config_manager.get_positive_int("WORKSPACE_CACHE_MAX_SIZE", default=1024)
         self.WORKSPACE_CACHE_TTL_SECONDS = config_manager.get_int("WORKSPACE_CACHE_TTL_SECONDS", default=300)
+        # The highest permission a workspace group rule may grant (issue #418). MANAGE is reachable
+        # only by raising this, and is warned about at startup. Normalised by
+        # _resolve_workspace_rules_max_permission below.
+        self.WORKSPACE_RULES_MAX_PERMISSION = config_manager.get("WORKSPACE_RULES_MAX_PERMISSION", "EDIT")
 
         # Proxy trust settings
         self.TRUSTED_PROXIES = config_manager.get_list("TRUSTED_PROXIES", default=[])
@@ -251,6 +286,12 @@ class AppConfig:
         # Failed SCIM authentications allowed per client IP per minute before answering 429.
         # In-process, like the limit above; 0 disables it.
         self.SCIM_AUTH_FAILURE_LIMIT_PER_MINUTE = config_manager.get_int("SCIM_AUTH_FAILURE_LIMIT_PER_MINUTE", default=60)
+        # SCIM activity log (#325): one row per /scim/v2 request for the admin UI's provisioning
+        # status. Rows older than this are swept by `mlflow-oidc db prune-sessions` and, at most
+        # hourly, by the server itself.
+        self.SCIM_ACTIVITY_RETENTION_DAYS = config_manager.get_int("SCIM_ACTIVITY_RETENTION_DAYS", default=30)
+        # Provisioning counts as healthy while a SCIM request succeeded within this many seconds.
+        self.SCIM_ACTIVITY_HEALTHY_WINDOW_SECONDS = config_manager.get_int("SCIM_ACTIVITY_HEALTHY_WINDOW_SECONDS", default=86400)
         # When set, resources a hard-deleted user was the last MANAGE holder of are granted MANAGE
         # to this username before the delete cascades. Unset means orphans are only reported.
         self.ORPHAN_FALLBACK_PRINCIPAL = config_manager.get("ORPHAN_FALLBACK_PRINCIPAL")
@@ -266,11 +307,51 @@ class AppConfig:
         self.AUTH_PROVIDERS = build_provider_registry(config_manager, self)
 
         # Run last: these read settings loaded above.
+        self._resolve_workspace_rules_max_permission()
         self._warn_if_resource_creation_restriction_is_inert()
         self._warn_if_default_permission_is_permissive()
         self._warn_if_username_field_unusable()
         self._warn_if_group_name_unusable()
         self._warn_if_provider_registry_invalid()
+        self._log_saml_login_binding()
+
+    #: Accepted ``SAML_LOGIN_BINDING`` values.
+    SAML_LOGIN_BINDING_MODES = ("auto", "on", "off")
+
+    @property
+    def saml_login_binding_enabled(self) -> bool:
+        """Whether SAML logins are bound to the starting browser by a nonce cookie (#374).
+
+        ``auto`` follows ``SESSION_COOKIE_SECURE``: the binding cookie is ``Secure``, so with
+        secure cookies off (plain-http development) it would never come back and every SAML
+        login would fail.
+        """
+        mode = getattr(self, "SAML_LOGIN_BINDING", "auto")
+        if mode == "on":
+            return True
+        if mode == "off":
+            return False
+        return bool(getattr(self, "SESSION_COOKIE_SECURE", False))
+
+    def _log_saml_login_binding(self) -> None:
+        """Say once, at startup, when a configured SAML provider logs in without the binding.
+
+        Silent when no SAML provider is configured: the setting has nothing to act on then.
+        """
+        if not any(provider.type == "saml" for provider in self.AUTH_PROVIDERS.providers):
+            return
+        # Fixed messages only: no config value is ever interpolated into these lines.
+        if self.SAML_LOGIN_BINDING == "on" and not self.SESSION_COOKIE_SECURE:
+            logger.warning(
+                "SAML login binding is forced on without secure cookies. This is for http test rigs only; production "
+                "deployments must serve https and enable secure session cookies."
+            )
+        elif not self.saml_login_binding_enabled:
+            logger.warning(
+                "SAML login binding is disabled while a SAML provider is configured: a SAML response is not bound to the "
+                "browser that started the login, so login CSRF is possible. Serve https and enable secure session "
+                "cookies to turn it on."
+            )
 
     #: Values that turn PKCE off. Both the words and the boolean spellings, because operators
     #: reach for whichever their config tooling already uses and a rejected value stops the
@@ -411,6 +492,25 @@ class AppConfig:
         if not self._has_usable_entry(self.OIDC_DISPLAY_NAME_FIELD):
             logger.warning("OIDC_DISPLAY_NAME_FIELD is empty; no OIDC login will be able to resolve a display name.")
 
+    def _resolve_workspace_rules_max_permission(self) -> None:
+        """Normalise WORKSPACE_RULES_MAX_PERMISSION, and warn when it lets rules grant MANAGE.
+
+        MANAGE on a workspace is enough to update or delete it and to grant MANAGE onward, so a rule
+        at that level hands the directory — whoever can create a matching group name — control of a
+        tenant. An unrecognised value (NO_PERMISSIONS included) is treated as READ rather than the
+        default: a typo in a ceiling must not raise it.
+        """
+        value = str(self.WORKSPACE_RULES_MAX_PERMISSION or "").strip().upper()
+        if value not in ("READ", "USE", "EDIT", "MANAGE"):
+            logger.warning("WORKSPACE_RULES_MAX_PERMISSION must be READ, USE, EDIT or MANAGE; treating the unrecognised value as READ.")
+            value = "READ"
+        self.WORKSPACE_RULES_MAX_PERMISSION = value
+        if value == "MANAGE":
+            logger.warning(
+                "WORKSPACE_RULES_MAX_PERMISSION=MANAGE lets workspace group rules grant MANAGE, which can update or delete a workspace "
+                "and grant MANAGE onward. Anyone who can create a group whose name matches such a rule gains that. Prefer EDIT."
+            )
+
     def _warn_if_group_name_unusable(self) -> None:
         """Warn at startup when OIDC_GROUP_NAME or OIDC_ADMIN_GROUP_NAME is unusable.
 
@@ -424,24 +524,34 @@ class AppConfig:
         reason as _warn_if_username_field_unusable: this is a module-level singleton
         imported by tooling that has nothing to do with OIDC login.
         """
-        if not self._has_usable_entry(self.OIDC_GROUP_NAME):
-            logger.warning("OIDC_GROUP_NAME is empty; no user will ever be recognized as a member of an allowed group and be able to log in.")
+        if not self._has_usable_entry(self.OIDC_GROUP_NAME) and not self._has_usable_entry(self.OIDC_GROUP_NAME_PATTERN):
+            logger.warning(
+                "OIDC_GROUP_NAME and OIDC_GROUP_NAME_PATTERN are empty; no user will ever be recognized as a member of an allowed group and be able to log in."
+            )
+        from mlflow_oidc_auth.group_patterns import matches_everything
+
+        # The offending pattern is not echoed: configuration values can come from a secret store,
+        # and the operator can find a match-everything entry in their own setting.
+        if any(isinstance(p, str) and matches_everything(p) for p in self.OIDC_GROUP_NAME_PATTERN):
+            logger.warning(
+                "OIDC_GROUP_NAME_PATTERN contains a pattern such as '*', which admits every user whose token carries any group at all. "
+                "Prefer a scoped pattern such as 'mlflow-*'."
+            )
         if not self._has_usable_entry(self.OIDC_ADMIN_GROUP_NAME):
             logger.warning("OIDC_ADMIN_GROUP_NAME is empty; no user will ever be granted admin access via group membership.")
 
     def _warn_if_default_permission_is_permissive(self) -> None:
-        """Announce that an open-by-default deployment will change on the next major.
+        """Warn when DEFAULT_MLFLOW_PERMISSION is configured to grant access.
 
         DEFAULT_MLFLOW_PERMISSION decides access when a resource has no user, group, regex
-        or group-regex grant. Shipping MANAGE means a fresh install is open by default:
-        every authenticated user can read, edit and delete every experiment and model
-        until grants exist. That default is changing to NO_PERMISSIONS (issue #293), which
-        is a breaking change for anyone relying on it.
+        or group-regex grant. It defaults to NO_PERMISSIONS (since v7.6.0, issue #293); a
+        granting value such as MANAGE makes the deployment open by default — every
+        authenticated user can read, edit and delete every experiment and model until
+        grants exist. That is usually set to keep pre-7.6 behaviour while migrating.
 
-        Warned at startup so the change is not a surprise on upgrade, and so operators can
-        act on it while the current release still behaves permissively. The counters added
-        alongside this (get_permission_fallback_counts) show how much access is actually
-        coming from the fallback in a running deployment.
+        Warned at startup so the open default stays visible rather than becoming a
+        forgotten setting. The counters (get_permission_fallback_counts) show how much
+        access is actually coming from the fallback in a running deployment.
 
         Silent when the deployment is unaffected: a default that grants nothing, or
         workspaces enabled — with workspaces, workspace permissions take the fallback role
@@ -463,9 +573,8 @@ class AppConfig:
         logger.warning(
             f"DEFAULT_MLFLOW_PERMISSION={self.DEFAULT_MLFLOW_PERMISSION} grants access to every resource that has no "
             "explicit permission, so any authenticated user can reach resources nobody granted them. "
-            "This default becomes NO_PERMISSIONS in the next major version (issue #293). "
-            "See docs/permissions.md 'Migrating to deny-by-default' — set the value explicitly now to pin "
-            "current behaviour, or create the grants your users rely on before upgrading."
+            "The shipped default is NO_PERMISSIONS (issue #293). "
+            "See docs/permissions.md 'Migrating to deny-by-default' to replace fallback access with explicit grants."
         )
 
     def _warn_if_resource_creation_restriction_is_inert(self) -> None:
@@ -473,10 +582,10 @@ class AppConfig:
 
         The creation validators require EDIT+ on the resource NAME, resolved from name
         regex and group-regex rules with a workspace fallback. When workspaces are off and
-        no regex matches, that resolution lands on DEFAULT_MLFLOW_PERMISSION — which ships
-        as MANAGE, and MANAGE grants can_update. So enabling the flag on a default install
-        denies nothing at all: every user can still create every experiment and registered
-        model, exactly as before.
+        no regex matches, that resolution lands on DEFAULT_MLFLOW_PERMISSION. It ships as
+        NO_PERMISSIONS (since v7.6.0), but when it is set to EDIT or MANAGE, both of which
+        grant can_update, enabling the flag denies nothing at all: every user can still create
+        every experiment and registered model, exactly as before.
 
         A flag that silently does nothing is worse than no flag, because operators
         reasonably read "RESTRICT_RESOURCE_CREATION=true" as "creation is restricted" and

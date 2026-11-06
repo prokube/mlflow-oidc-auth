@@ -3,24 +3,29 @@
 Uses custom method names (create/get/get_for_user/list_for_user/update/delete)
 and relies on GroupRepository for user-group listing, so methods are individually
 delegated or overridden rather than simply inherited.
+
+Bound to ``permission_kinds.REGISTERED_MODEL`` with no ``prompt`` filter (its ``group`` role is in
+``unfiltered_roles``): the permission lookups ``get_for_user`` and ``list_for_user`` count a group
+grant on a name whatever its flag, so managing registered model group grants sees, updates and
+revokes exactly those rows. Prompts and registered models share one name space per workspace.
 """
 
 from typing import List, Optional
 
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST
-from sqlalchemy.orm import Session
 
-from mlflow_oidc_auth.db.models import SqlGroup, SqlRegisteredModelGroupPermission, SqlUser, SqlUserGroup
+from mlflow_oidc_auth import permission_kinds
+from mlflow_oidc_auth.db.models import SqlRegisteredModelGroupPermission, SqlUser, SqlUserGroup
 from mlflow_oidc_auth.entities import RegisteredModelPermission
-from mlflow_oidc_auth.permissions import _validate_permission, compare_permissions
+from mlflow_oidc_auth.permissions import compare_permissions
 from mlflow_oidc_auth.repository._base import BaseGroupPermissionRepository
 from mlflow_oidc_auth.repository import GroupRepository
-from mlflow_oidc_auth.repository.utils import get_group, get_user, list_user_groups
+from mlflow_oidc_auth.repository.utils import get_user, list_user_groups
 
 
 class RegisteredModelPermissionGroupRepository(BaseGroupPermissionRepository[SqlRegisteredModelGroupPermission, RegisteredModelPermission]):
-    model_class = SqlRegisteredModelGroupPermission
+    grant_kind = permission_kinds.REGISTERED_MODEL
     resource_id_attr = "name"
 
     def __init__(self, session_maker):
@@ -45,7 +50,7 @@ class RegisteredModelPermissionGroupRepository(BaseGroupPermissionRepository[Sql
 
     def rename(self, old_name: str, new_name: str):
         with self._Session(read_only=False) as session:
-            perms = session.query(self.model_class).filter(self.model_class.name == old_name).all()
+            perms = session.query(self.model_class).filter(self._resource_is(old_name)).all()
             if not perms:
                 raise MlflowException(
                     f"No registered model group permissions found for name: {old_name}",
@@ -54,23 +59,6 @@ class RegisteredModelPermissionGroupRepository(BaseGroupPermissionRepository[Sql
             for perm in perms:
                 perm.name = new_name
             session.flush()
-
-    # -- list_groups_for_model: prompt=False filter ----------------------------
-
-    def list_groups_for_model(self, name: str) -> List[tuple[str, str]]:
-        """List groups that have explicit permissions for a registered model.
-
-        Returns pairs of (group_name, permission).
-        """
-        with self._Session() as session:
-            rows = (
-                session.query(SqlGroup.group_name, self.model_class.permission)
-                .join(self.model_class, self.model_class.group_id == SqlGroup.id)
-                .filter(self.model_class.name == name)
-                .filter(self.model_class.prompt == False)
-                .all()
-            )
-            return [(str(group_name), str(permission)) for group_name, permission in rows]
 
     # -- get_for_user uses GroupRepository ------------------------------------
 
@@ -84,7 +72,7 @@ class RegisteredModelPermissionGroupRepository(BaseGroupPermissionRepository[Sql
                 .join(SqlUser, SqlUser.id == SqlUserGroup.user_id)
                 .filter(
                     SqlUser.username == username,
-                    SqlRegisteredModelGroupPermission.name == name,
+                    self._resource_is(name),
                 )
                 .order_by(SqlRegisteredModelGroupPermission.group_id)
                 .all()
@@ -119,5 +107,5 @@ class RegisteredModelPermissionGroupRepository(BaseGroupPermissionRepository[Sql
         with self._Session() as session:
             user = get_user(session, username=username)
             user_groups = list_user_groups(session, user)
-            perms = session.query(self.model_class).filter(self.model_class.group_id.in_([ug.group_id for ug in user_groups])).all()
+            perms = session.query(self.model_class).filter(self.model_class.group_id.in_([ug.group_id for ug in user_groups]), self._in_scope()).all()
             return [p.to_mlflow_entity() for p in perms]

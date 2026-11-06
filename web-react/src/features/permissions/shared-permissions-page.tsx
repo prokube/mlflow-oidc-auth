@@ -1,18 +1,23 @@
 import { useState, useEffect } from "react";
 import { useParams, Link } from "react-router";
 import PageContainer from "../../shared/components/page/page-container";
-import type { PermissionType } from "../../shared/types/entity";
+import {
+  supportsRegexPermissions,
+  type PermissionType,
+} from "../../shared/types/entity";
 import { Switch } from "../../shared/components/switch";
-import { TokenInfoBlock } from "../../shared/components/token-info-block";
-import { useUserDetails } from "../../core/hooks/use-user-details";
 import { useUser } from "../../core/hooks/use-user";
 import { useRuntimeConfig } from "../../shared/context/use-runtime-config";
 import { NormalPermissionsView } from "./components/normal-permissions-view";
 import { RegexPermissionsView } from "./components/regex-permissions-view";
 import { encodeRouteParam } from "../../shared/utils/string-utils";
+import { UserTokensPanel } from "../tokens/components/user-tokens-panel";
+
+/** A permission tab, or the admin-only "tokens" tab of a user or service account. */
+export type SharedPermissionsTab = PermissionType | "tokens";
 
 interface SharedPermissionsPageProps {
-  type: PermissionType;
+  type: SharedPermissionsTab;
   baseRoute: string;
   entityKind: "user" | "group";
 }
@@ -34,10 +39,7 @@ export const SharedPermissionsPage = ({
 
   const { currentUser } = useUser();
   const { gen_ai_gateway_enabled: genAiGatewayEnabled } = useRuntimeConfig();
-  const { user: userDetails, refetch: userDetailsRefetch } = useUserDetails({
-    username:
-      entityKind === "user" && currentUser?.is_admin ? entityName : null,
-  });
+  const canManageTokens = entityKind === "user" && !!currentUser?.is_admin;
 
   const [isRegexMode, setIsRegexMode] = useState(() => {
     const savedValue = localStorage.getItem(IS_REGEX_MODE_KEY);
@@ -69,26 +71,24 @@ export const SharedPermissionsPage = ({
           { id: "ai-models", label: "AI\u00A0Models" },
         ]
       : []),
+    { id: "mcp-servers", label: "MCP\u00A0Servers" },
+    ...(canManageTokens ? [{ id: "tokens", label: "Tokens" }] : []),
   ];
+
+  // MCP servers have user and group grants only: no regex mode there.
+  const showRegex =
+    isRegexMode && type !== "tokens" && supportsRegexPermissions(type);
 
   return (
     <PageContainer
       title={
-        isRegexMode
-          ? `Regex Permissions for ${entityName}`
-          : `Permissions for ${entityName}`
+        type === "tokens"
+          ? `Tokens for ${entityName}`
+          : showRegex
+            ? `Regex Permissions for ${entityName}`
+            : `Permissions for ${entityName}`
       }
     >
-      <div className="flex items-end gap-6">
-        {entityKind === "user" && currentUser?.is_admin && (
-          <TokenInfoBlock
-            username={entityName}
-            passwordExpiration={userDetails?.password_expiration}
-            onTokenGenerated={userDetailsRefetch}
-          />
-        )}
-      </div>
-
       <div className="flex space-x-2 justify-between items-center border-b border-btn-secondary-border dark:border-btn-secondary-border-dark mb-3 min-w-0">
         <div className="flex space-x-2 overflow-x-auto whitespace-nowrap scrollbar-hide">
           {tabs.map((tab) => (
@@ -105,7 +105,9 @@ export const SharedPermissionsPage = ({
             </Link>
           ))}
         </div>
-        {currentUser?.is_admin && (
+        {currentUser?.is_admin &&
+          type !== "tokens" &&
+          supportsRegexPermissions(type) && (
           <Switch
             checked={isRegexMode}
             onChange={setIsRegexMode}
@@ -120,7 +122,9 @@ export const SharedPermissionsPage = ({
         )}
       </div>
 
-      {isRegexMode ? (
+      {type === "tokens" ? (
+        canManageTokens && <UserTokensPanel username={entityName} />
+      ) : showRegex && supportsRegexPermissions(type) ? (
         <RegexPermissionsView
           type={type}
           entityKind={entityKind}

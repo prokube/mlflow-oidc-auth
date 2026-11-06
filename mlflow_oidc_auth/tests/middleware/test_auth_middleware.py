@@ -92,6 +92,104 @@ class TestAuthMiddleware:
         assert auth_middleware._is_unprotected_route("/api/experiments") is False
         assert auth_middleware._is_unprotected_route("/protected") is False
 
+    def test_is_unprotected_route_honours_mlflow_static_prefix(self, auth_middleware, monkeypatch):
+        """MLflow mounts health/metrics/static-files under ``--static-prefix`` when it is set.
+
+        The prefix lands in the path rather than in ``root_path``, so the probe must be
+        recognised under it too, or a prefixed deployment would answer its own health check
+        with a login redirect and never become ready.
+        """
+        from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR
+
+        monkeypatch.setenv(STATIC_PREFIX_ENV_VAR, "/custom-path")
+
+        assert auth_middleware._is_unprotected_route("/custom-path/health") is True
+        # MLflow mounts the probe itself, nothing below it; only the bundle is a tree.
+        assert auth_middleware._is_unprotected_route("/custom-path/health/check") is False
+        assert auth_middleware._is_unprotected_route("/custom-path/healthz") is False
+        assert auth_middleware._is_unprotected_route("/custom-path/metrics-x") is False
+        assert auth_middleware._is_unprotected_route("/custom-path/metrics") is True
+        assert auth_middleware._is_unprotected_route("/custom-path/static-files/js/app.js") is True
+
+    def test_static_prefix_does_not_unprotect_other_routes(self, auth_middleware, monkeypatch):
+        """Only the unprotected prefixes are matched, not everything under the static prefix."""
+        from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR
+
+        monkeypatch.setenv(STATIC_PREFIX_ENV_VAR, "/custom-path")
+
+        assert auth_middleware._is_unprotected_route("/custom-path/api/2.0/mlflow/users") is False
+        assert auth_middleware._is_unprotected_route("/custom-path/api/2.0/mlflow/experiments") is False
+        # The prefix must end on a path boundary; a sibling directory is not the prefixed route.
+        assert auth_middleware._is_unprotected_route("/custom-pathx/health") is False
+        # The plugin's own unprotected routes are never mounted under the static prefix, so their
+        # prefixed forms are not unprotected either.
+        for path in ("/scim/v2/Users", "/slo/oidc", "/saml/metadata/x", "/login", "/callback", "/oidc/ui/", "/docs", "/openapi.json"):
+            assert auth_middleware._is_unprotected_route(f"/custom-path{path}") is False, path
+        # The prefix is removed once, never repeatedly.
+        assert auth_middleware._is_unprotected_route("/custom-path/custom-path/health") is False
+
+    @pytest.mark.parametrize(
+        "prefix", ["/healthcheck", "/healthcheck/", "/health", "/static", "/static-files", "/metrics-ui", "/docs", "/oidc", "/scim/v2", "/slo", "/login"]
+    )
+    def test_static_prefix_overlapping_the_unprotected_list_opens_nothing(self, auth_middleware, monkeypatch, prefix):
+        """A static prefix that begins like an unprotected route must not open MLflow's routes.
+
+        Every MLflow route is registered under the prefix, so matching such a path against the
+        plugin's list would leave the whole API unauthenticated (``/healthcheck/api/...`` begins
+        with ``/health``). Under the prefix only MLflow's own probes are open.
+        """
+        from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR
+
+        monkeypatch.setenv(STATIC_PREFIX_ENV_VAR, prefix)
+
+        base = prefix.rstrip("/")
+        for route in ("/api/2.0/mlflow/experiments/search", "/ajax-api/2.0/mlflow/users/current", "/graphql", "/get-artifact", "/", "/version"):
+            assert auth_middleware._is_unprotected_route(f"{base}{route}") is False, f"{base}{route}"
+        assert auth_middleware._is_unprotected_route(base) is False
+        assert auth_middleware._is_unprotected_route(f"{base}/health") is True
+        assert auth_middleware._is_unprotected_route(f"{base}/static-files/js/app.js") is True
+
+    def test_static_prefix_covering_a_plugin_route_does_not_open_it_by_a_probe_like_segment(self, auth_middleware, monkeypatch):
+        """Prefix ``/gateway`` covers the gateway's routes; an endpoint named ``health`` stays protected."""
+        from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR
+
+        monkeypatch.setenv(STATIC_PREFIX_ENV_VAR, "/gateway")
+        assert auth_middleware._is_unprotected_route("/gateway/health/mlflow/invocations") is False
+        monkeypatch.setenv(STATIC_PREFIX_ENV_VAR, "/oidc/webhook")
+        assert auth_middleware._is_unprotected_route("/oidc/webhook/health") is True  # MLflow's probe under that prefix
+        assert auth_middleware._is_unprotected_route("/oidc/webhook/health/x") is False
+
+    @pytest.mark.parametrize(
+        "prefix, conflicts",
+        [
+            ("/custom-path", ()),
+            ("/", ()),
+            ("/healthcheck", ()),
+            ("/health", ("/health",)),
+            ("/oidc", ("/oidc/static", "/oidc/ui")),
+            ("/scim", ("/scim/v2/",)),
+            ("/scim/v2/", ("/scim/v2/",)),
+            ("/providers", ("/providers",)),
+        ],
+    )
+    def test_static_prefix_conflicts_names_the_routes_it_covers(self, monkeypatch, prefix, conflicts):
+        """Startup names the plugin's unauthenticated routes a static prefix would cover."""
+        from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR
+
+        from mlflow_oidc_auth.middleware.route_path import static_prefix_conflicts
+
+        monkeypatch.setenv(STATIC_PREFIX_ENV_VAR, prefix)
+        assert static_prefix_conflicts() == conflicts
+
+    def test_prefixed_probe_stays_protected_without_a_static_prefix(self, auth_middleware, monkeypatch):
+        """A deployment without ``--static-prefix`` opens nothing new."""
+        from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR
+
+        monkeypatch.delenv(STATIC_PREFIX_ENV_VAR, raising=False)
+
+        assert auth_middleware._is_unprotected_route("/custom-path/health") is False
+        assert auth_middleware._is_unprotected_route("/custom-path/static-files/js/app.js") is False
+
     @pytest.mark.asyncio
     async def test_authenticate_basic_auth_success(self, auth_middleware, mock_store):
         """Test successful basic authentication."""
@@ -610,6 +708,23 @@ class TestAuthMiddleware:
         assert not hasattr(request.state, "is_admin")
 
     @pytest.mark.asyncio
+    async def test_dispatch_prefixed_health_bypasses_authentication(self, auth_middleware, create_mock_request, monkeypatch):
+        """Regression: a ``--static-prefix`` health probe must not be redirected to the IdP."""
+        from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR
+
+        monkeypatch.setenv(STATIC_PREFIX_ENV_VAR, "/custom-path")
+        request = create_mock_request(path="/custom-path/health")
+
+        async def mock_call_next(req):
+            return Response(content="OK", status_code=200)
+
+        response = await auth_middleware.dispatch(request, mock_call_next)
+
+        assert response.status_code == 200
+        assert response.body == b"OK"
+        assert not hasattr(request.state, "username")
+
+    @pytest.mark.asyncio
     async def test_dispatch_authenticated_user(self, auth_middleware, create_mock_request, mock_store):
         """Test dispatch for authenticated user sets request state correctly."""
         with patch("mlflow_oidc_auth.middleware.auth_middleware.store", mock_store):
@@ -1012,10 +1127,9 @@ class TestAuthMiddleware:
 
         # Create a request that raises exception when accessing hasattr
         class BadRequest:
-            def __getattribute__(self, name):
-                if name == "session":
-                    raise RuntimeError("Outer exception")
-                return super().__getattribute__(name)
+            @property
+            def session(self):
+                raise RuntimeError("Outer exception")
 
         request = BadRequest()
 
@@ -1116,3 +1230,43 @@ class TestLoginRedirectSchemeRelative:
         location = response.headers["location"]
         assert location.startswith("/mlflow/login")
         assert "http://" not in location and "https://" not in location
+
+
+class TestLoginRedirectNextKeepsForwardedPrefix:
+    """``next`` must carry the forwarded prefix, or the callback lands the user outside the app (#444).
+
+    A prefix-stripping proxy routes ``/mlstore/x`` to ``/x`` and sends ``X-Forwarded-Prefix``, which
+    becomes the base path. The callback redirects to ``next`` verbatim, so ``next`` has to be the
+    browser-visible path. A proxy that keeps the prefix must not get it twice.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "base_path, path, query, expected_next",
+        [
+            ("/mlstore", "/", "", "/mlstore/"),
+            ("/mlstore", "/", "x=1", "/mlstore/?x=1"),
+            ("/mlstore", "/experiments", "", "/mlstore/experiments"),
+            ("/mlstore", "/mlstore/experiments", "", "/mlstore/experiments"),
+            ("/mlstore", "/mlstore", "", "/mlstore"),
+            ("/mlstore", "/mlstorefront", "", "/mlstore/mlstorefront"),
+            ("", "/experiments", "", "/experiments"),
+        ],
+    )
+    async def test_next_is_browser_visible_path(self, base_path, path, query, expected_next):
+        from unittest.mock import AsyncMock
+        from urllib.parse import parse_qs, urlparse
+
+        middleware = AuthMiddleware.__new__(AuthMiddleware)
+        request = MagicMock(url=MagicMock(scheme="http", path=path, query=query), headers={}, scope={})
+
+        with (
+            patch("mlflow_oidc_auth.middleware.auth_middleware.config") as cfg,
+            patch("mlflow_oidc_auth.utils.get_base_path", new=AsyncMock(return_value=base_path)),
+        ):
+            cfg.AUTOMATIC_LOGIN_REDIRECT = True
+            response = await middleware._handle_auth_redirect(request)
+
+        location = urlparse(response.headers["location"])
+        assert location.path == f"{base_path}/login"
+        assert parse_qs(location.query)["next"] == [expected_next]

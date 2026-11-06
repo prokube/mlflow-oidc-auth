@@ -1,39 +1,39 @@
 import { useCallback, useMemo, useState } from "react";
 import {
   faCheck,
+  faDesktop,
+  faIdCard,
   faUserCheck,
   faUserSlash,
 } from "@fortawesome/free-solid-svg-icons";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { SearchInput } from "../../shared/components/search-input";
-import { useAllUsers } from "../../core/hooks/use-all-users";
+import { usePagedList } from "../../core/hooks/use-paged-list";
 import { useAllUserDetails } from "../../core/hooks/use-all-user-details";
 import { EntityListTable } from "../../shared/components/entity-list-table";
 import { useSearch } from "../../core/hooks/use-search";
 import { useUser } from "../../core/hooks/use-user";
 import PageContainer from "../../shared/components/page/page-container";
 import PageStatus from "../../shared/components/page/page-status";
-import { RowActionButton } from "../../shared/components/row-action-button";
 import { IconButton } from "../../shared/components/icon-button";
+import { EntityNameLink } from "../../shared/components/entity-name-link";
 import { Switch } from "../../shared/components/switch";
 import { LifecycleBadge } from "../../shared/components/lifecycle-badge";
+import { buildEntityRoute } from "../../shared/utils/string-utils";
 import { useToast } from "../../shared/components/toast/use-toast";
 import { extractErrorMessage } from "../../core/services/http";
-import { setUserActive } from "../../core/services/user-service";
+import {
+  fetchUsersPage,
+  setUserActive,
+} from "../../core/services/user-service";
 import { DeactivateUserModal } from "./components/deactivate-user-modal";
+import { UserSessionsModal } from "./components/user-sessions-modal";
+import { UserIdentitiesModal } from "./components/user-identities-modal";
 import type { ColumnConfig } from "../../shared/types/table";
 import type { UserDetails } from "../../shared/types/user";
 
-const renderPermissionsButton = (username: string) => (
-  <div className="invisible group-hover:visible">
-    <RowActionButton
-      entityId={username}
-      suffix="/experiments"
-      route="/users"
-      buttonText="Manage permissions"
-    />
-  </div>
-);
+const userHref = (username: string) =>
+  buildEntityRoute("/users", username, "/experiments");
 
 /**
  * Non-admin view: `GET /users/details` is admin-only, so non-admins keep
@@ -48,32 +48,24 @@ function LegacyUsersView() {
     handleClearSearch,
   } = useSearch();
 
-  const { isLoading, error, refresh, allUsers } = useAllUsers();
-
-  const usersList = allUsers || [];
-
-  const filteredUsers = usersList.filter((username) =>
-    username.toLowerCase().includes(submittedTerm.toLowerCase()),
+  const { isLoading, error, refresh, items, pagination } = usePagedList(
+    fetchUsersPage,
+    submittedTerm,
   );
 
-  const tableData = filteredUsers.map((username) => ({
+  const tableData = items.map((username) => ({
     id: username,
     username,
   }));
 
-  const columnsWithAction: ColumnConfig<{ id: string; username: string }>[] = [
+  const columns: ColumnConfig<{ id: string; username: string }>[] = [
     {
       header: "Username",
       render: ({ username }) => (
-        <span className="truncate block" title={username}>
+        <EntityNameLink to={userHref(username)} title={username}>
           {username}
-        </span>
+        </EntityNameLink>
       ),
-    },
-    {
-      header: "Permissions",
-      render: ({ username }) => renderPermissionsButton(username),
-      className: "flex-shrink-0",
     },
   ];
 
@@ -99,8 +91,10 @@ function LegacyUsersView() {
           </div>
           <EntityListTable
             data={tableData}
+            pagination={pagination}
             searchTerm={submittedTerm}
-            columns={columnsWithAction}
+            columns={columns}
+            getRowHref={({ username }) => userHref(username)}
           />
         </>
       )}
@@ -113,6 +107,11 @@ type UserRow = UserDetails & { id: string };
 /**
  * Admin view: managed/inactive state plus activate/deactivate actions
  * (issue #320).
+ *
+ * Paginated client-side on purpose: the "Show inactive" filter is applied
+ * locally on `active` (the endpoint has no such filter), so the whole list is
+ * fetched and `EntityListTable` pages the filtered result — the counts stay
+ * right whichever way the switch is set.
  */
 function AdminUsersView() {
   const {
@@ -136,6 +135,8 @@ function AdminUsersView() {
     null,
   );
   const [isReactivating, setIsReactivating] = useState(false);
+  const [sessionsUser, setSessionsUser] = useState<string | null>(null);
+  const [identitiesUser, setIdentitiesUser] = useState<string | null>(null);
 
   const filteredUsers = useMemo(() => {
     return users
@@ -206,20 +207,20 @@ function AdminUsersView() {
     [deactivatingUser, updateLocalUser, showToast],
   );
 
-  const mutedClass = (active: boolean) =>
-    active ? "" : "opacity-50";
+  const mutedClass = (active: boolean) => (active ? "" : "opacity-50");
 
   const columns: ColumnConfig<UserRow>[] = useMemo(
     () => [
       {
         header: "Username",
         render: (user) => (
-          <span
-            className={`truncate block ${mutedClass(user.active)}`}
+          <EntityNameLink
+            to={userHref(user.username)}
+            className={mutedClass(user.active)}
             title={user.username}
           >
             {user.username}
-          </span>
+          </EntityNameLink>
         ),
       },
       {
@@ -235,7 +236,9 @@ function AdminUsersView() {
       },
       {
         header: "State",
-        render: (user) => <LifecycleBadge variant="state" active={user.active} />,
+        render: (user) => (
+          <LifecycleBadge variant="state" active={user.active} />
+        ),
       },
       {
         header: "Managed by",
@@ -257,25 +260,34 @@ function AdminUsersView() {
           ) : null,
       },
       {
-        header: "Permissions",
-        render: (user) => renderPermissionsButton(user.username),
-        className: "flex-shrink-0",
-      },
-      {
         header: "Actions",
         render: (user) => (
-          <div className="invisible group-hover:visible">
+          <div className="flex space-x-2">
+            <IconButton
+              icon={faDesktop}
+              title="Sessions"
+              onClick={() => setSessionsUser(user.username)}
+              muted
+            />
+            <IconButton
+              icon={faIdCard}
+              title="Identities"
+              onClick={() => setIdentitiesUser(user.username)}
+              muted
+            />
             {user.active ? (
               <IconButton
                 icon={faUserSlash}
                 title="Deactivate user"
                 onClick={() => setDeactivatingUser(user)}
+                muted
               />
             ) : (
               <IconButton
                 icon={faUserCheck}
                 title="Reactivate user"
                 onClick={() => setReactivatingUser(user)}
+                muted
               />
             )}
           </div>
@@ -316,6 +328,7 @@ function AdminUsersView() {
             data={tableData}
             searchTerm={submittedTerm}
             columns={columns}
+            getRowHref={(user) => userHref(user.username)}
           />
 
           <DeactivateUserModal
@@ -337,6 +350,15 @@ function AdminUsersView() {
             user={reactivatingUser}
             isProcessing={isReactivating}
             targetActive
+          />
+
+          <UserSessionsModal
+            username={sessionsUser}
+            onClose={() => setSessionsUser(null)}
+          />
+          <UserIdentitiesModal
+            username={identitiesUser}
+            onClose={() => setIdentitiesUser(null)}
           />
         </>
       )}

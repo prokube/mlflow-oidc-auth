@@ -10,15 +10,17 @@ The application is configured through environment variables, `.env` files, or pl
 |----------|------|---------|-------------|
 | `OIDC_DISCOVERY_URL` | String | *Required* | OIDC discovery endpoint URL (e.g., `https://idp.example.com/.well-known/openid-configuration`) |
 | `OIDC_CLIENT_ID` | String | *Required* | Client ID registered with your OIDC provider |
-| `OIDC_CLIENT_SECRET` | String | *Required* | Client secret for your OIDC application |
-| `OIDC_REDIRECT_URI` | String | Auto-detected | Redirect URI for the OIDC callback (`/callback`). If not set, calculated dynamically from proxy headers, which works correctly behind reverse proxies |
+| `OIDC_CLIENT_SECRET` | String | *Required unless `OIDC_PUBLIC_CLIENT`* | Client secret for your OIDC application. Leave it unset only for a client declared public with `OIDC_PUBLIC_CLIENT=true` — see [Public clients](#public-clients). Unset without that declaration, the client is not registered and an error names it |
+| `OIDC_PUBLIC_CLIENT` | Boolean | `false` | Declare the client a **public client**: one the provider issued without a client secret. It is registered with no secret, and PKCE (`OIDC_CODE_CHALLENGE`, on by default) authenticates the token exchange instead. Requires PKCE, and refuses an `OIDC_CLIENT_SECRET` set alongside it — both are errors that leave the client unregistered. See [Public clients](#public-clients) |
+| `OIDC_REDIRECT_URI` | String | Auto-detected | Redirect URI for the OIDC callback (`/callback`). If not set, calculated dynamically from proxy headers, which works correctly behind reverse proxies once `TRUSTED_PROXIES` is set. Users must browse MLflow on the same origin as this URI, or login fails at the callback — see [Troubleshooting](troubleshooting#login-fails-after-returning-from-the-identity-provider) |
 | `OIDC_SCOPE` | String | `openid,email,profile` | Comma-separated list of OIDC scopes to request |
 | `OIDC_AUDIENCE` | String | None | Expected JWT `aud` claim value (e.g., your client ID or API identifier). When set, bearer tokens are rejected if the `aud` claim doesn't match. Recommended for production to prevent token confusion attacks |
 | `OIDC_ISSUER` | String | None | Expected JWT `iss` claim value. When set, tokens whose issuer does not match are rejected. Also a required precondition for `OIDC_PROVISION_ON_BEARER_AUTH` |
-| `OIDC_PROVISION_ON_BEARER_AUTH` | Boolean | `false` | Auto-create a permission record on first bearer-token authentication for API-first users who never logged in via the browser (fixes ownerless resources, issue #262). Requires **both** `OIDC_AUDIENCE` and `OIDC_ISSUER` set. Provisioned users are **non-admin** and must pass the same group-authorization gate as interactive login. **Note:** unlike browser login (which reads groups from the userinfo endpoint), the bearer path resolves groups from the token itself — the access token must carry the groups claim (or `OIDC_GROUP_DETECTION_PLUGIN` must accept the presented JWT), otherwise the user fails the group gate and is not provisioned (they continue to be denied creation, never silently over-granted) |
+| `OIDC_PROVISION_ON_BEARER_AUTH` | Boolean | `false` | Auto-create a permission record on first bearer-token authentication for API-first users who never logged in via the browser (fixes ownerless resources, issue #262). Requires **both** `OIDC_AUDIENCE` and `OIDC_ISSUER` set. Provisioned users are **non-admin** and are treated as interactive login from the same provider would treat them: the same group-authorization gate (an admin group name admits only through a provider with `admin_source: claims`), no account for a provider whose `provisioning` is not `jit`, and the same group membership — namespaced as `<provider-id>:<group>` for any provider but `default`, and none for `group_sync: none`. **Note:** unlike browser login (which reads groups from the ID token, or from the UserInfo endpoint with `OIDC_USERINFO_GROUPS` — see [Claims and the UserInfo endpoint](#claims-and-the-userinfo-endpoint)), the bearer path resolves groups from the token itself — the access token must carry the groups claim (or `OIDC_GROUP_DETECTION_PLUGIN` must accept the presented JWT), otherwise the user fails the group gate and is not provisioned (they continue to be denied creation, never silently over-granted) |
 | `OIDC_TRUST_BEARER_GROUP_CLAIMS` | Boolean | `false` | Whether a bearer token may confer **admin** (via `OIDC_ADMIN_GROUP_NAME` membership in its group claim). Default false: admin is never granted from a token. Only enable if the IdP — not the token subject — controls the groups claim on audience-restricted tokens |
 | `OIDC_PROVIDER_DISPLAY_NAME` | String | `Login with OIDC` | Display name shown on the login page button |
-| `OIDC_GROUPS_ATTRIBUTE` | String | `groups` | Attribute name in the ID token that contains the user's group memberships |
+| `OIDC_GROUPS_ATTRIBUTE` | String | `groups` | Claim that contains the user's group memberships, read from the ID token — or, with `OIDC_USERINFO_GROUPS`, from the UserInfo response when the ID token lacks it (see [Claims and the UserInfo endpoint](#claims-and-the-userinfo-endpoint)) |
+| `OIDC_USERINFO_GROUPS` | Boolean | `false` | Let the groups claim (`OIDC_GROUPS_ATTRIBUTE`) and the workspace claim (`OIDC_WORKSPACE_CLAIM_NAME`) be read from the provider's UserInfo endpoint when the ID token lacks them. Off by default: those claims decide who may log in, who is an administrator and which workspaces a user joins, so they come from the ID token alone unless you opt in. Identity claims are completed from UserInfo either way. Registry equivalent: `userinfo_groups`. See [Claims and the UserInfo endpoint](#claims-and-the-userinfo-endpoint) |
 | `OIDC_USERNAME_FIELD` | String | `email,preferred_username` | Comma-separated list of userinfo/token claim names tried in order to resolve the login identity. The first non-empty string field wins and is lowercased. Use this when your IdP shouldn't be identified by email (e.g. it may be reassigned) or when you want a stable claim like `sub` instead. **Note:** leaving this effectively empty logs a startup warning — no login or bearer-token authentication could ever resolve a username |
 | `OIDC_DISPLAY_NAME_FIELD` | String | `name` | Comma-separated list of userinfo/token claim names tried in order to resolve the human-readable display name shown in the UI. The first non-empty string field wins. **Note:** leaving this effectively empty logs a startup warning — no login could ever resolve a display name |
 | `OIDC_SESSION_EXPIRY_LEEWAY_SECONDS` | Integer | `30` | Clock-skew leeway applied to the IdP-issued token expiry. Sessions are rejected once `now >= expires_at - leeway`, forcing the user back through the OIDC login flow so IdP-side changes (deactivation, group changes, MFA enrollment) take effect within the token's lifetime instead of waiting for the cookie TTL |
@@ -30,7 +32,49 @@ Per-provider fields set on an entry in `AUTH_PROVIDERS` / `AUTH_PROVIDERS_FILE` 
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `public_client` | Boolean | `false` | Declare this OIDC provider a **public client**, registered without a client secret and authenticated by PKCE instead. The same rules as `OIDC_PUBLIC_CLIENT`: requires PKCE, and refuses a secret (`OIDC_CLIENT_SECRET_<PROVIDER_ID>`) configured alongside it. Without it, a provider with no secret is not registered. Accepted only on `oidc` providers; set on `saml` or `k8s` the entry is refused at load. Must be a JSON boolean (`"true"` is refused). For the synthesised `default` provider it comes from `OIDC_PUBLIC_CLIENT`. See [Public clients](#public-clients) |
+| `bearer_adopts_unbound_accounts` | Boolean | `false` | `oidc` providers other than `default` only. Let this provider's bearer tokens reach an existing non-admin person's account that no identity has ever been recorded for — typically one its bearer provisioning created before identities were bound — and bind it to the token's `(provider, sub)` on first use, after which only that identity reaches it. Never an account in an email domain whose accounts belong to another provider (unless listed in its `allowed_email_domains`), and never one carrying the identity migration's placeholder: for an account from before identities were recorded, an administrator removes the placeholder first (`DELETE /api/2.0/mlflow/users/{username}/identities`). Off by default. Turn it on for a CI or service-principal issuer whose accounts predate this release. Must be a JSON `true` or `false` |
+| `userinfo_groups` | Boolean | `false` | `oidc` providers only. Let this provider's UserInfo endpoint supply the groups and workspace claims when the ID token lacks them. The same rules as `OIDC_USERINFO_GROUPS`, which sets it for the synthesised `default` provider. Must be a JSON `true` or `false` (a string such as `"true"` is rejected), and is rejected on a `saml` or `k8s` provider. See [Claims and the UserInfo endpoint](#claims-and-the-userinfo-endpoint) |
+| `interactive` | Boolean | `true` for `oidc` and `saml`, `false` for `k8s` | Whether the provider carries a browser login and appears on the login page. Set `false` on an `oidc` provider that only issues tokens to workloads — a service principal's client-credentials tokens or a CI workload-identity issuer. A bearer token from a non-interactive provider authenticates normally but is refused (`403`) by every endpoint that issues an access token. Must be a JSON boolean; `true` on a `k8s` provider is refused at load. See [Programmatic access](programmatic-access#idp-client-credentials-and-workload-identity) |
 | `allow_tokens_without_expiry` | Boolean | `false` | Accept a bearer token that carries no `exp` claim. By default every provider — including the synthesised `default` one — refuses such a token, because nothing else would ever make it stop working. Accepted only on token providers (`oidc`, `k8s`); set on `saml` or any other type the entry is refused at load. Must be a JSON boolean (`"true"` is refused). Waives only a *missing* `exp`: a present `exp` in the past, the issuer, the audience and the signature are all still enforced. Setting it logs a warning at startup. Intended for legacy Kubernetes service-account tokens — see [Kubernetes service accounts](kubernetes-auth#tokens-without-an-expiry) |
+
+**Bearer tokens with more than one provider.** When the registry holds more than one provider of
+any type — two OIDC providers, SAML beside an OIDC provider, or the `default` provider beside a
+Kubernetes one — a bearer token is held to the same identity decision as a browser login from its
+provider: the identity `(provider, sub)` decides which user it reaches, never the email or
+username it carries. A bound identity reaches only its own user; an account another provider's
+identity owns is refused; an account from before identities were recorded can be reached only
+through the `default` provider; and a token from any other provider without a `sub` is refused.
+A service account is reached only the way its sign-in source says, with one provider or with none
+(see [Programmatic access](programmatic-access#automation-oidc-service-accounts)).
+A token whose identity has no account yet is accepted only once `OIDC_PROVISION_ON_BEARER_AUTH`
+has created the account and bound it to that identity, as a login binds it. An account this provider's
+bearer provisioning created before this release is unbound and is refused, unless the provider sets
+`bearer_adopts_unbound_accounts`. An administrator can list and remove a user's identity bindings
+(`GET`/`DELETE /api/2.0/mlflow/users/{username}/identities`) when a subject changes — a re-created
+client, or a CI workflow that now issues a different `sub`. Decisions are cached
+for `PERMISSION_CACHE_TTL_SECONDS` (not a decision to create an account) and flushed when a user
+is deleted or an identity is bound — on every replica with the Redis cache backend, on the replica
+that made the change with the local one, where other replicas' entries expire with the TTL.
+With a single provider, bearer authentication is unchanged.
+
+**A provider cannot claim another provider's email domain.** A provider other than `default`
+may not create an account (at login, or on first bearer authentication) named by an email
+address in a domain whose existing accounts belong to another provider — accounts with no bound
+identity count as `default`'s. Creating it would bind the address to that provider for good and
+lock out its real owner. It needs no configuration: a domain belongs to whoever's accounts are in
+it. Always allowed: usernames that are not email addresses (Kubernetes service accounts, workload
+names), a domain listed in the provider's own `allowed_email_domains`, and a domain with no
+accounts yet or only this provider's. The rule reacts to domains that already have accounts: in a domain no
+one has used yet, the first provider to create an account owns it. For a domain you must reserve
+before anyone signs in, use `identity_binding: email` with `allowed_email_domains` on the provider
+that should own it, or have accounts created there first (for example by SCIM).
+
+> **Upgrading:** where several providers serve the same directory — an OIDC and a SAML entry for
+> one IdP, say — list the shared domain in `allowed_email_domains` on every provider other than
+> `default` (SAML entries accept it too). Otherwise a user's first login through such a provider is
+> refused once the domain holds accounts from another; the refusal is logged and audited, naming
+> the domain and the setting.
 
 ### SAML provider fields
 
@@ -60,17 +104,20 @@ Fields for an entry with `"type": "saml"` (requires the `[saml]` extra). They ar
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `OIDC_GROUP_NAME` | String | `mlflow` | Comma-separated list of allowed groups. Users must belong to at least one of these groups (or an admin group) to log in. **Note:** leaving this effectively empty logs a startup warning — no user could ever be recognized as a member of an allowed group |
+| `OIDC_GROUP_NAME` | String | `mlflow` | Comma-separated list of allowed group names, matched exactly. Users must belong to at least one of these groups, match `OIDC_GROUP_NAME_PATTERN`, or be in an admin group to log in. A name containing `*`, `?` or `[` still means only itself. **Note:** leaving both this and `OIDC_GROUP_NAME_PATTERN` effectively empty logs a startup warning — no user could ever be recognized as a member of an allowed group |
+| `OIDC_GROUP_NAME_PATTERN` | String | *(empty)* | Comma-separated list of case-sensitive shell-style patterns (`*`, `?`, `[...]`) for allowed groups, e.g. `mlflow-*` to admit every team group without listing each one. Opt-in: empty by default, so existing deployments admit exactly what they did. Checked after `OIDC_GROUP_NAME`; a login admitted by a pattern is audited as `auth.admitted_by_group_pattern` with the pattern and the matching group. A pattern never confers admin rights — `OIDC_ADMIN_GROUP_NAME` stays exact. A pattern of only `*` admits every user whose token carries any group at all and logs a startup warning |
 | `OIDC_ADMIN_GROUP_NAME` | String | `mlflow-admin` | Comma-separated list of admin groups. Members have full admin privileges and bypass all permission checks. **Note:** leaving this effectively empty logs a startup warning — no user could ever be granted admin access via group membership |
-| `OIDC_GROUP_DETECTION_PLUGIN` | String | None | Python module path for a custom group detection plugin. When set, groups are extracted from the access token using this plugin instead of the ID token's groups attribute |
+| `OIDC_GROUP_DETECTION_PLUGIN` | String | None | Python module path for a custom group detection plugin. When set, groups are extracted from the access token using this plugin instead of the ID token's groups attribute. The plugin must expose `get_user_groups(access_token)`. If its signature also declares a `token_response` parameter (or accepts `**kwargs`), it is additionally called with `token_response=` — on interactive login this is the full authlib token response (`id_token`, `access_token`, `userinfo`, etc.); on the bearer-token path it is `{"access_token": <token>, "claims": <validated JWT claims>}`. Detected once per plugin via `inspect.signature` and cached, so a plugin written against the original single-argument signature keeps working unchanged (issue #250) |
+
+Both settings apply to browser login (OIDC and SAML) and to bearer auto-provisioning. They are evaluated locally against the groups the provider already asserted, so they add no provider API call. Empty and non-string claim values are ignored, and a claim with no usable group admits nobody. After a successful login every valid group in the claim is synchronised to the authorization database, not only the one that matched. With several providers, names and patterns are matched against the group names each provider sends, so a partner IdP whose groups match `mlflow-*` is admitted too — scope patterns to names you control.
 
 ### Permissions
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `DEFAULT_MLFLOW_PERMISSION` | String | `MANAGE` | Default permission level when no explicit permission is found. Options: `READ`, `USE`, `EDIT`, `MANAGE`, `NO_PERMISSIONS`. See [Permissions](permissions) |
+| `DEFAULT_MLFLOW_PERMISSION` | String | `NO_PERMISSIONS` | Default permission level when no explicit permission is found (deny by default since v7.6.0; it was `MANAGE` before). Options: `READ`, `USE`, `EDIT`, `MANAGE`, `NO_PERMISSIONS`. See [Permissions](permissions) |
 | `PERMISSION_SOURCE_ORDER` | String | `user,group,regex,group-regex` | Comma-separated order for evaluating permission sources. The first source with a matching permission wins. See [Permissions](permissions#permission-source-order) |
-| `RESTRICT_RESOURCE_CREATION` | Boolean | `false` | When enabled, require EDIT+ permission (via name regex / group-regex, with a workspace fallback) to create experiments and registered models. **Note:** ineffective on its own if `DEFAULT_MLFLOW_PERMISSION` is left at the default `MANAGE` — lower it below `EDIT` (or use workspaces) to actually restrict creation. Off by default, matching upstream MLflow. See [Resource Creation Authorization](permissions#resource-creation-authorization) |
+| `RESTRICT_RESOURCE_CREATION` | Boolean | `false` | When enabled, require EDIT+ permission (via name regex / group-regex, with a workspace fallback) to create experiments and registered models. **Note:** ineffective on its own if `DEFAULT_MLFLOW_PERMISSION` is `EDIT` or `MANAGE`. It works with the default `NO_PERMISSIONS` and with `READ` or `USE`, since none of those can create; or use workspaces. Off by default, matching upstream MLflow. See [Resource Creation Authorization](permissions#resource-creation-authorization) |
 
 ### Database
 
@@ -84,7 +131,7 @@ Fields for an entry with `"type": "saml"` (requires the `[saml]` extra). They ar
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `SECRET_KEY` | String | Auto-generated | Secret key used to sign session cookies. **All replicas must share the same value** in multi-instance deployments. If not set, a random key is generated on startup and a warning is logged — sessions will not survive restarts or work across replicas |
-| `TRUSTED_PROXIES` | String (CSV) | Empty (trust all) | Comma-separated list of trusted proxy IP addresses or CIDR ranges (e.g., `10.0.0.0/8,172.16.0.0/12`). When configured, `X-Forwarded-*` headers from untrusted sources are ignored. When empty, all proxy headers are trusted for backward compatibility |
+| `TRUSTED_PROXIES` | String (CSV) | Empty (trust no proxy) | Comma-separated list of trusted proxy IP addresses or CIDR ranges (e.g., `10.0.0.0/8,172.16.0.0/12`). `X-Forwarded-*` and `X-Real-IP` headers are honoured only from a connecting client inside one of these ranges and ignored from every other client; a value with no valid entry trusts no client. When empty, no proxy is trusted: the headers are ignored from every client and this is logged once at startup. **A deployment behind a reverse proxy must set this** to the proxy's address or range — see [Reverse proxies](#reverse-proxies) |
 | `AUTOMATIC_LOGIN_REDIRECT` | Boolean | `false` | When `true`, unauthenticated browser requests are automatically redirected to the OIDC login page instead of showing the login UI |
 
 ### UI Behavior
@@ -93,6 +140,7 @@ Fields for an entry with `"type": "saml"` (requires the `[saml]` extra). They ar
 |----------|------|---------|-------------|
 | `EXTEND_MLFLOW_MENU` | Boolean | `true` | Inject sign-in/sign-out links and permission management navigation into MLflow's built-in UI |
 | `EXTEND_MLFLOW_REAUTH` | Boolean | `true` | Inject a small script into MLflow's UI that triggers a full page reload on any 401 response. Without this, an expired session leaves the SPA rendering empty pages until a manual force-reload, because React Router intercepts URL-bar navigations as soft routing |
+| `EXTEND_MLFLOW_REDIRECT_ADMIN` | Boolean | `true` | Inject a small script into MLflow's UI that sends MLflow's built-in admin pages (`#/admin`, `#/admin/users/<name>`, `#/admin/roles/...`, `#/admin/ws?workspace=<name>`, `#/account`) to the matching page of this plugin's UI under `oidc/ui/`. Those pages are built for MLflow's own basic-auth RBAC and fail against this plugin. The redirect grants nothing: the target page applies its own authorization. It is injected only while `EXTEND_MLFLOW_MENU` or `EXTEND_MLFLOW_REAUTH` is on, so turning both off leaves MLflow's `index.html` untouched |
 | `DEFAULT_LANDING_PAGE_IS_PERMISSIONS` | Boolean | `true` | Use the permissions management page as the default landing page in the admin UI |
 
 ### Feature Flags
@@ -100,8 +148,8 @@ Fields for an entry with `"type": "saml"` (requires the `[saml]` extra). They ar
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `OIDC_GEN_AI_GATEWAY_ENABLED` | Boolean | `true` | Enable AI Gateway permission management in the admin UI and API. Disable if you don't use MLflow AI Gateway |
-| `MLFLOW_ENABLE_WORKSPACES` | Boolean | `false` | Enable workspace (multi-tenant) support. Requires MLflow >=3.10. See [Workspaces](workspaces) |
-| `ENABLE_API_DOCS` | Boolean | `true` | Enable OpenAPI documentation at `/openapi.json`, Swagger UI at `/docs`, and ReDoc at `/redoc` |
+| `MLFLOW_ENABLE_WORKSPACES` | Boolean | `false` | Enable workspace (multi-tenant) support. See [Workspaces](workspaces) |
+| `ENABLE_API_DOCS` | Boolean | `false` | Enable OpenAPI documentation at `/openapi.json`, Swagger UI at `/docs`, and ReDoc at `/redoc` |
 
 ### Caching
 
@@ -111,15 +159,34 @@ The plugin uses TTL caches to avoid repeated database lookups on every request. 
 |----------|------|---------|-------------|
 | `OIDC_JWKS_CACHE_TTL_SECONDS` | Integer | `300` | Time-to-live (seconds) for the JWKS key set cache. The OIDC provider's signing keys are fetched once and cached for this duration. This is always a local in-process cache (not affected by `CACHE_BACKEND`) because JWKS data is identical across replicas |
 | `OIDC_HTTP_TIMEOUT_SECONDS` | Integer | `10` | Timeout (seconds) applied to OIDC discovery and JWKS HTTP fetches. Set lower for faster failover when the IdP is unreachable; without a timeout a hung IdP can block request threads until the OS-level TCP timeout (~2 minutes), causing cascading auth failures |
-| `OIDC_VERIFY_SSL` | Boolean | `true` | Verify the OIDC provider's TLS certificate on discovery, JWKS, and token requests. Only set to `false` for providers using self-signed certificates in a trusted network |
+| `OIDC_VERIFY_SSL` | Boolean | `true` | Verify the OIDC provider's TLS certificate on discovery, JWKS, and token requests. Only set to `false` for providers using self-signed certificates in a trusted network. Certificates are checked against the operating system's trust store, so a private or TLS-inspection root CA installed system-wide is trusted (see *Outbound HTTPS trusts the operating system's certificate store* under Upgrading) |
 | `OIDC_CODE_CHALLENGE` | String | `S256` | PKCE code-challenge method for the authorization-code flow. `S256` (or `true`/`yes`/`on`/`1`), or `none`/`off`/`false`/`no`/`0` to disable. An unrecognised value warns and falls back to `S256`. See [PKCE](#pkce) |
 | `MANAGED_BY_ENFORCEMENT` | String | `report` | What happens when one source writes a row another owns: `off`, `report` (audit only) or `enforce`. See [Row ownership](#row-ownership) |
 | `PERMISSION_CACHE_TTL_SECONDS` | Integer | `30` | Time-to-live (seconds) for the permission resolution cache. Cached permission decisions expire after this duration. Lower values mean faster propagation of permission changes; higher values reduce database load |
+| `PERMISSION_CACHE_MAX_SIZE` | Integer | `10000` | Maximum number of entries in the permission resolution cache (per replica for `local`; ignored by `redis`, whose size is bounded by the Redis server). Single checks cache one entry per resource; list pages resolve every row against the user's cached grants (one entry per user and resource type, same size bound), so a value too small for the number of concurrent users makes them evict each other and re-query the database |
 | `CACHE_BACKEND` | String | `local` | Cache backend for permission and workspace caches. Options: `local` (in-process TTL cache) or `redis` (shared Redis instance). Use `redis` for multi-replica deployments where permission changes must propagate immediately across all replicas |
 | `CACHE_REDIS_URL` | String | None | Redis connection URL. Required when `CACHE_BACKEND=redis`. Example: `redis://localhost:6379/0` or `redis://:password@redis-host:6379/1` |
 | `CACHE_KEY_PREFIX` | String | `mlflow_oidc_auth:` | Key prefix for Redis cache entries. Useful when sharing a Redis instance with other applications |
 
 > **Note:** Permission caches are automatically invalidated when permissions are created, updated, or deleted through the plugin's API. The TTL acts as a safety net, not the primary invalidation mechanism.
+
+> **Multiple replicas:** invalidation reaches every replica only with `CACHE_BACKEND=redis`. With `local`, each replica has its own cache, and a write invalidates only the replica that served it. Elsewhere, a revoked or changed permission can be served until its entry expires: up to `PERMISSION_CACHE_TTL_SECONDS` for resource decisions and `WORKSPACE_CACHE_TTL_SECONDS` for workspace grants. A *new* workspace grant can likewise be refused on another replica while that replica still holds a cached denial for the user and workspace. Denials are therefore kept no longer than `PERMISSION_CACHE_TTL_SECONDS` (default 30 s). A workspace lookup that fails (for example on a database error) is refused and not cached.
+
+> **Upgrading with a shared Redis cache:** this release changes the workspace cache's key format: usernames and workspace names are now percent-encoded, so `alice@x.com` is stored as `alice%40x.com`. The workspace grant cache also moves to a new namespace, `workspace_v2`. New replicas never read old-format keys. However, while old and new replicas run side by side against one Redis, neither can invalidate the other's workspace entries, so a revoked workspace grant can be served for up to `WORKSPACE_CACHE_TTL_SECONDS`. With `CACHE_BACKEND=redis`, either restart all replicas together, or, once the last old replica is gone, delete these keys (shown with the default `CACHE_KEY_PREFIX=mlflow_oidc_auth:`):
+>
+> - `mlflow_oidc_auth:workspace:*` (old format; unused after the upgrade, and otherwise left to expire)
+> - `mlflow_oidc_auth:workspace_v2:*`
+> - `mlflow_oidc_auth:workspace_denials:*`
+> - `mlflow_oidc_auth:workspace_generation:*`
+>
+> The permission decision cache moves to a new namespace too, `permissions_v2` (its entries now carry their own expiry, capped by the grants they were built from), and the grants each user is resolved against are cached in `grant_context_v2`, guarded by `grant_context_generation`. Old replicas never read these, nor new replicas the old `permissions` entries; while both run side by side, neither invalidates the other's entries, so a revoked grant can be served for up to `PERMISSION_CACHE_TTL_SECONDS`. Once the last old replica is gone, delete:
+>
+> - `mlflow_oidc_auth:permissions:*` (old format; otherwise left to expire)
+> - `mlflow_oidc_auth:permissions_v2:*`
+> - `mlflow_oidc_auth:grant_context_v2:*`
+> - `mlflow_oidc_auth:grant_context_generation:*`
+>
+> With `CACHE_BACKEND=local` there is nothing to do.
 
 > **Compatibility:** Any Redis-protocol-compatible server works — including [Valkey](https://valkey.io/), [Dragonfly](https://www.dragonflydb.io/), and [KeyDB](https://docs.keydb.dev/). The plugin uses standard Redis commands (`GET`, `SET`, `DELETE`, `SCAN`) via the `redis-py` client library.
 
@@ -134,8 +201,9 @@ These settings only apply when `MLFLOW_ENABLE_WORKSPACES=true`.
 | `OIDC_WORKSPACE_DETECTION_PLUGIN` | String | None | Python module path for a custom workspace detection plugin. Used to extract workspace assignments from the OIDC token |
 | `OIDC_WORKSPACE_REQUIRE_CREATION_CONTEXT` | Boolean | `false` | Reject workspace-gated create requests when no workspace context is present |
 | `OIDC_WORKSPACE_DENY_DEFAULT_CREATION` | Boolean | `false` | Reject non-admin workspace-gated create requests that resolve to the `default` workspace, including requests that send no workspace context |
-| `WORKSPACE_CACHE_MAX_SIZE` | Integer | `1024` | Maximum number of entries in the workspace permission cache |
-| `WORKSPACE_CACHE_TTL_SECONDS` | Integer | `300` | Time-to-live (seconds) for workspace permission cache entries |
+| `WORKSPACE_CACHE_MAX_SIZE` | Integer | `1024` | Maximum number of entries in the workspace permission cache. Grants and denials are kept in two separate caches of this size, so denials can never evict a grant |
+| `WORKSPACE_CACHE_TTL_SECONDS` | Integer | `300` | Time-to-live (seconds) for cached workspace grants. Cached denials expire after the smaller of this and `PERMISSION_CACHE_TTL_SECONDS` |
+| `WORKSPACE_RULES_MAX_PERMISSION` | String | `EDIT` | Highest permission a [workspace group rule](workspaces#group-rules) may grant: `READ`, `USE`, `EDIT` or `MANAGE`. `MANAGE` logs a startup warning; an unrecognised value is treated as `READ`. Grants held by a rule above it are removed at startup |
 
 ### SCIM
 
@@ -147,6 +215,8 @@ token. See [SCIM Provisioning](scim).
 | `SCIM_TOKEN_ROTATION_OVERLAP_SECONDS` | Integer | `3600` | How long a rotated SCIM token keeps working next to its replacement |
 | `SCIM_RATE_LIMIT_PER_MINUTE` | Integer | `600` | Requests per minute allowed for each SCIM token, counted **per process** (N replicas allow up to N times this). `0` disables the limit |
 | `SCIM_AUTH_FAILURE_LIMIT_PER_MINUTE` | Integer | `60` | Failed SCIM authentications allowed per client IP per minute before `429`. Counted per process, like the rate limit. `0` disables it |
+| `SCIM_ACTIVITY_RETENTION_DAYS` | Integer | `30` | Days of SCIM activity kept for the provisioning status. Older rows are deleted by `mlflow-oidc db prune-sessions` and hourly by the server. `0` keeps everything. See [Provisioning status](scim#provisioning-status-and-activity) |
+| `SCIM_ACTIVITY_HEALTHY_WINDOW_SECONDS` | Integer | `86400` | Provisioning counts as healthy while a SCIM request succeeded within this many seconds |
 | `ORPHAN_FALLBACK_PRINCIPAL` | String | None | Username that receives `MANAGE` on resources a hard-deleted user was the last manager of. When unset, orphans are only reported as `resource.orphaned` audit events |
 | `USER_RETENTION_DAYS` | Integer | `0` | Reserved for a future purge of deactivated users. `0` means never; nothing reads it yet |
 
@@ -189,6 +259,63 @@ curl -X PATCH "$MLFLOW/api/2.0/mlflow/users/ownership" \
 
 or in bulk with the CLI below, for an operator who has a shell.
 
+### Delete and create
+
+A delete goes through the same guard as an update, before anything else happens. Under `enforce`
+a source cannot delete a row it may not write. The admin API needs `"admin_override": true` for
+that. The attempt is audited as `user.ownership_conflict` with `detail.operation: "delete"`.
+
+A create never takes over an existing row. When the username exists, the create is refused with
+`RESOURCE_ALREADY_EXISTS` in every mode, and the row and its owner stay as they were. When that
+row belongs to another source, the attempt is also audited (`operation: "create"`). Together
+these rules stop a source from deleting a row it does not own and creating it again as `manual`.
+
+### Group membership
+
+Group membership carries permissions, so each membership (`user_groups` row) records its own
+owner:
+
+| Written by | Owner |
+|---|---|
+| An administrator, or any write from before this was recorded | `manual` |
+| SCIM `/Groups` | `scim` |
+| A login's claims, bearer provisioning, a service account | `oidc:<provider>` or `saml:<provider>` |
+
+Adding a membership never counts as a cross-source write: the writer owns the new row, and a
+membership that already exists keeps its owner. Removing one depends on the membership's owner
+and on the kind of write:
+
+| Membership owner | Removed by its own source | By another source's **sync** (login, SCIM `PUT`) | By another source's targeted removal |
+|---|---|---|---|
+| `manual` | yes | yes | yes, except that SCIM may not remove a hand-made administrator's under `enforce` |
+| `scim`, `oidc:*`, `saml:*` | yes | **never, in any mode**; recorded as kept | `report`: yes, audited. `enforce`: refused |
+
+An `authoritative` login therefore revokes its own memberships and every `manual` one, and
+leaves SCIM's and other providers' in place in every mode. Every membership that predates this is
+`manual`, so revocation keeps working after an upgrade without a backfill, and a deployment that
+changes nothing sees no change. Each membership a sync leaves in place is recorded as
+`user.ownership_conflict` with `detail.operation: "membership.sync_kept"`, `status: "success"`
+and `detail.group`. It is not a denial, so it does not inflate denial counts.
+A refused targeted removal is `detail.operation: "membership.remove"` with `status: "denied"`.
+
+A kept row is recorded in every mode, `off` included, where the sync also logs one INFO line
+per sync (the user or group, how many rows it kept, and their owners). **A renamed provider
+(`oidc:kc` → `oidc:keycloak`) or a move from OIDC to SAML makes that provider's old memberships
+foreign to it**, so its syncs keep them instead of revoking them. Hand them to the new source
+with `mlflow-oidc db reconcile-ownership --memberships --from-owner <old> --set-owner <new>`.
+
+A sync never fails because a row was kept: failing it would lock the user or the group out of
+every future sync. A targeted removal fails with nothing applied (`409` from SCIM).
+
+### Group ownership
+
+Groups record who created them too (`groups.managed_by`): `scim` for SCIM, `oidc:<provider>` /
+`saml:<provider>` for a group a login's claims brought into existence (a Kubernetes namespace
+group included), and `manual` for everything else, including every group that existed before the
+column. Under `enforce` SCIM may write, fill or delete only the groups it owns. See
+[SCIM: Group ownership](scim#group-ownership). `reconcile-ownership --groups` hands a group to
+another source.
+
 ### Changing ownership
 
 Ownership never changes implicitly — not at startup, not when a provider's configuration
@@ -211,6 +338,17 @@ runs. `restore-ownership` is also a dry run without `--apply`.
 
 **This is the repair path when a source is turned off.** Point `--from-owner` at it and
 `--set-owner` at `manual`, and the rows it used to own become editable again.
+
+Add `--groups` with `--group NAME` or `--from-owner` to re-own groups instead of user rows, for
+example to let a directory manage a group that existed before it. Every filter must apply to the
+table being rewritten: `--username` with `--groups`, or `--group` without it, is refused rather
+than ignored. `--set-owner` accepts `manual`, `scim`, `oidc:<id>` and `saml:<id>`. Add `--memberships` to re-own
+group memberships too. `--from-owner` then matches each
+membership's owner, and `--username` the member. The journal records them, and
+`restore-ownership` puts them back. From the API, `PATCH /api/2.0/mlflow/users/ownership` with
+`"memberships": true` hands all of one user's memberships to the new owner. Without one of these,
+the memberships of a source you have turned off cannot be removed by any other source under
+`enforce`.
 
 ## PKCE
 
@@ -258,6 +396,82 @@ a provider that genuinely offers only `plain`, set `none` so the state is explic
 > **Note:** with PKCE enabled, authlib logs the per-attempt code verifier at `DEBUG`. It is
 > single-use and short-lived, but `LOG_LEVEL=DEBUG` is not a good idea in production for this
 > reason among others.
+
+### Public clients
+
+A **public client** is one the provider issues without a client secret, because there is nowhere
+to keep one. Declare it explicitly and leave the secret unset:
+
+```bash
+OIDC_CLIENT_ID=mlflow-public
+OIDC_PUBLIC_CLIENT=true
+# no OIDC_CLIENT_SECRET
+```
+
+For a provider in the registry, set `"public_client": true` on its entry and leave
+`OIDC_CLIENT_SECRET_<PROVIDER_ID>` unset.
+
+The client is then registered with no secret at all. authlib authenticates its token, refresh and
+revocation requests with the `none` method — the `client_id` in the request body, no
+`Authorization` header — and PKCE is what binds the authorization code to the login attempt. The
+secret is left out of the registration rather than set blank, so the `none` method is chosen
+because there is no secret, not because of how authlib happens to read an empty one.
+
+The declaration is required. A missing secret on its own is never taken to mean "public client",
+because a secret that failed to load from a secrets manager must be reported as missing, not
+quietly change how the client authenticates. Registration follows these rules, and every refusal
+logs an error naming the provider (never the secret) while the other providers carry on:
+
+| Declared public | Client secret | PKCE | Result |
+|-----------------|---------------|------|--------|
+| no | set | any | Registered as a confidential client, as before |
+| no | unset | any | **Refused**: set the client secret, or declare the client public |
+| yes | unset | on | Registered as a public client |
+| yes | any | off | **Refused**: a public client needs PKCE (`OIDC_CODE_CHALLENGE`) |
+| yes | set | on | **Refused**: contradictory configuration — remove the secret or the declaration |
+
+Each refusal is logged once per provider per process, not on every readiness probe.
+
+A public client's refresh token (with `OIDC_USE_REFRESH_TOKEN`) is redeemable with the
+`client_id` alone. It is kept encrypted on the server-side session row either way; if your
+provider offers refresh-token rotation, enable it for a public client.
+
+### Claims and the UserInfo endpoint
+
+A browser login reads its claims — the username (`OIDC_USERNAME_FIELD`), the display name
+(`OIDC_DISPLAY_NAME_FIELD`), the groups (`OIDC_GROUPS_ATTRIBUTE`) and, with workspaces enabled,
+the workspace claim (`OIDC_WORKSPACE_CLAIM_NAME`) — from the **ID token**, after it has been
+validated (signature, issuer, audience, expiry, nonce).
+
+Some providers, many academic and eduGAIN ones among them, release email, name or groups only
+from the **UserInfo endpoint**. When an **identity** claim — the username or display name — is
+missing from the ID token and the provider's discovery document advertises a
+`userinfo_endpoint`, the callback calls that endpoint once with the login's access token, through
+the same provider's client (same TLS settings and timeouts).
+
+The **groups and workspace claims** decide who may log in, who is an administrator and which
+workspaces a user joins, so by default they come from the ID token alone: they are never read
+from UserInfo, and a missing one does not cause a UserInfo call. To let UserInfo supply them, set
+`OIDC_USERINFO_GROUPS=true` (or `"userinfo_groups": true` on a registry entry). Then a missing
+groups claim (without `OIDC_GROUP_DETECTION_PLUGIN`) or workspace claim (with workspaces enabled
+and no `OIDC_WORKSPACE_DETECTION_PLUGIN`) also triggers the call, and is filled from the response.
+
+- **Subject binding.** The UserInfo `sub` must equal the ID token's `sub` (OpenID Connect Core
+  5.3.2). A response with no `sub` or another one refuses the login. An ID token without a `sub`
+  has nothing to bind a response to, so UserInfo is not used for it.
+- **Precedence.** The ID token always wins. UserInfo only fills claims the ID token does not
+  carry, never replaces one, and never supplies claims describing the authentication itself
+  (`iss`, `aud`, `exp`, `iat`, `nbf`, `nonce`, `azp`, `at_hash`, `sid`, `auth_time`, `acr`, `amr`
+  and similar). `email_verified` is taken from UserInfo only together with `email`.
+- **Username stability.** When the ID token yields a username, that username is used even if
+  UserInfo carries a higher-priority `OIDC_USERNAME_FIELD` claim, so completing other claims never
+  moves a user to a different account.
+- **Failure.** If the call fails — network error, non-2xx status, or a body that is not a JSON
+  object (a signed or encrypted `application/jwt` response is not accepted) — the login continues
+  with the ID token's claims, and fails as before if those are not enough.
+
+Bearer-token authentication does not call the UserInfo endpoint; it reads the claims of the
+presented token.
 
 ## Sessions
 
@@ -314,7 +528,7 @@ refused, so the table grows until an operator prunes it:
 mlflow-oidc db prune-sessions --url postgresql://user:pass@host/auth_db
 ```
 
-It also deletes expired SAML replay records (`saml_assertions`), which are needed only while their assertion could still validate. Add `--dry-run` to see the count without deleting. Revoked-but-unexpired rows are kept until
+It also deletes expired SAML replay records (`saml_assertions`), which are needed only while their assertion could still validate, and SCIM activity older than `SCIM_ACTIVITY_RETENTION_DAYS`. Add `--dry-run` to see the count without deleting. Revoked-but-unexpired rows are kept until
 their expiry, so "was this session revoked, and when?" stays answerable. Running it from cron is
 the expected deployment.
 
@@ -331,12 +545,129 @@ Additional session cookie settings:
 | `SESSION_COOKIE_MAX_AGE_SECONDS` | Integer | `1209600` (2 weeks) | Absolute session lifetime in seconds, fixed at login and not extended by activity. `0` makes the *cookie* last only as long as the browser session; the server-side session still expires after two weeks |
 | `SESSION_COOKIE_SAMESITE` | String | `lax` | SameSite flag prevents the browser from sending session cookie along with cross-site requests |
 | `SESSION_COOKIE_SECURE` | Boolean | `false` | Indicate that the "Secure" flag should be set (can be used with HTTPS only), set this to `true` in production to ensure the session cookie is only sent over HTTPS |
+| `SAML_LOGIN_BINDING` | String | `auto` | Binds a SAML login to the browser that started it with a short-lived `HttpOnly; Secure; SameSite=None` nonce cookie scoped to the ACS (login-CSRF defence). `auto`: on iff `SESSION_COOKIE_SECURE=true`; `on`: forced even over http (loopback test rigs only, logged as a warning); `off`: disabled. Any other value refuses to start. See [SAML: browser binding](saml-auth.md#browser-binding) |
+
+## Reverse proxies
+
+`ProxyHeadersMiddleware` applies `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-Port`,
+`X-Forwarded-Prefix` and `X-Forwarded-For` (or `X-Real-IP`) to each request so redirects and
+callback URLs are built correctly behind a proxy, so a deployment served under a sub-path (for
+example `/mlflow`) routes correctly, and so the SCIM failed-authentication limit and its audit
+events name the original client rather than the proxy. The connection address the application
+sees (`request.client`) is never replaced. Authorization is always decided on the routed path — the
+request path with the forwarded prefix removed — which is the same path the application
+dispatches on, and the workspace is resolved on that same path.
+
+These headers are only meaningful when they come from your proxy, so they are honoured only from
+the addresses listed in `TRUSTED_PROXIES`. **A deployment behind a reverse proxy must set it** to
+the proxy's address or CIDR range:
+
+```bash
+TRUSTED_PROXIES=10.0.0.0/8
+```
+
+List only proxies: every address inside a listed range can set these headers. IPv4-mapped IPv6
+addresses are matched as their IPv4 form, both for the connecting address (`::ffff:10.0.0.5`)
+and for entries: `::ffff:10.0.0.5` is read as `10.0.0.5` and `::ffff:10.0.0.0/104` as
+`10.0.0.0/8`, and each such conversion is logged at startup. Either notation works.
+
+When `TRUSTED_PROXIES` is unset, no proxy is trusted: the plugin ignores the headers from every
+client, and this is logged once at startup at `INFO`. Scheme, host, path and client
+address are then the direct connection's, and redirect and callback URLs are built from them
+unless `OIDC_REDIRECT_URI` is configured. When it is set, the headers from any other client are
+ignored; a value in which no entry parses as an address or range trusts no client at all.
+
+For `X-Forwarded-For`, the proxy should append the address it received the request from (the
+usual behaviour). The client address is the right-most entry that is not itself inside
+`TRUSTED_PROXIES`, reading repeated header lines as one list; when that entry is not an IP
+address, the direct connection's address is used. `X-Real-IP` is read only when there is no
+`X-Forwarded-For`. Make sure the proxy overwrites, rather than appends to, any other
+`X-Forwarded-*` header a client sends.
+
+The trust decision is made on the connection address the ASGI server reports. uvicorn, which
+`mlflow server` runs, applies `X-Forwarded-For` and `X-Forwarded-Proto` itself for the peers in
+its `FORWARDED_ALLOW_IPS` setting (`127.0.0.1` by default) and reports the forwarded address as
+the connection address. Keep uvicorn's default: MLflow relies on it to tell same-host requests
+from proxied ones. The simplest setup is a proxy on its own, non-loopback address listed in
+`TRUSTED_PROXIES`, which uvicorn leaves alone. A proxy on `127.0.0.1` has its requests reported
+with the client's address, which the plugin does not trust unless that address is itself inside
+`TRUSTED_PROXIES`; for such a deployment set `OIDC_REDIRECT_URI` and serve the application at the
+same path the proxy exposes rather than relying on `X-Forwarded-Prefix`.
+
+## Upgrading: workspace-scoped grants and sign-in rules (breaking)
+
+This release changes what a running deployment does on upgrade. Upgrade every replica together; the
+migrations and a grant backfill run on start. What changes, and what an operator does about it:
+
+- **MLflow 3.16.0 or later is required** (see [Installation](installation)).
+- **Every existing service account becomes internal.** It signs in only with access tokens issued
+  for it; an identity provider's token that reached it by naming it — a service principal's
+  client-credentials token, a CI job's workload-identity token — is refused. For each account a
+  workload reaches with an IdP token, set its sign-in source to that provider (**Service
+  Accounts** page, or `PUT /api/2.0/mlflow/users/{username}/service-account-source` with
+  `{"source": "<provider-id>"}`; give `"subject"` too for an administrator account). Any change of
+  source revokes the account's access tokens and sessions. Kubernetes service accounts keep
+  working. No service account signs in through the browser. See
+  [Programmatic access](programmatic-access#automation-oidc-service-accounts).
+- **Grants on models, prompts and AI Gateway resources belong to one workspace**, and existing
+  ones are assigned a workspace on start; with workspaces enabled, a grant the grantee could not
+  reach is marked unresolved and matches nothing. Deleting a workspace removes its grants. See
+  [Workspaces → Upgrading: existing grants](workspaces#upgrading-existing-grants). Enabling
+  workspaces later does not copy `default`'s grants to other workspaces.
+- **Pattern grants apply in the workspace they were made in**; existing patterns apply everywhere,
+  as before ([Workspaces → Pattern grants](workspaces#pattern-regex-grants)).
+- **Group grants on AI Gateway resources take effect** — they were ignored before. Review them.
+- **The permission API honours workspace permissions** when the request names a workspace, instead
+  of `DEFAULT_MLFLOW_PERMISSION`; an experiment is judged only in its own workspace.
+- **MCP servers**: changes need someone holding `MANAGE` on a server, so existing servers stay
+  admin-only for changes until granted; with workspaces enabled, reading and searching need
+  permissions ([Permissions → MCP Server Registry](permissions#mcp-server-registry)).
+- **With more than one provider in the registry** — of any type, so the `default` provider beside a
+  Kubernetes one counts:
+  - a bearer token reaches only the account its `(provider, sub)` identity is bound to — a token
+    whose username claim has drifted reaches the account bound to its `sub`, as a login does;
+    accounts a non-default provider's bearer provisioning created before this release are refused
+    unless that provider sets `bearer_adopts_unbound_accounts` (see its limits above; identities
+    are listed and removed with `GET`/`DELETE /api/2.0/mlflow/users/{username}/identities`);
+  - a provider other than `default` cannot create accounts in an email domain whose accounts
+    belong to another provider: list shared domains in its `allowed_email_domains`;
+  - bearer-provisioned users of a provider other than `default` get `<provider-id>:<group>`
+    groups, as on login — grant to those names; bearer provisioning also applies login's admin
+    gate and refuses a provider whose `provisioning` is not `jit`; such a provider no longer
+    creates usernames with more than one `@`.
+- **Downgrading** removes grants and patterns recorded for workspaces other than `default`, MCP
+  server grants, and every service account's sign-in source.
 
 ## Upgrading to this release
 
-Three behaviour changes ship together in this release. None require a configuration change to
-keep working; each is called out here because it changes what a running deployment does on
-upgrade.
+These behaviour changes ship together in this release. Each is called out here because it
+changes what a running deployment does on upgrade; the first one requires a configuration change
+for deployments behind a reverse proxy.
+
+- **Prompts are judged by prompt permissions (#479).** MLflow's prompt calls (reading, editing,
+  tagging, aliasing, deleting and versioning a prompt, prompt search results, GraphQL) used model
+  patterns. They now use **prompt patterns**, like the prompt grant APIs, and model patterns no
+  longer reach prompts. Exact-name grants are unchanged and still apply to both. Users who reach
+  prompts only through a model pattern lose that access on upgrade; users with a prompt pattern
+  gain it. **Before upgrading,** add a prompt pattern for each model pattern meant to cover prompts
+  (the Admin UI's prompt patterns, or `POST /api/2.0/mlflow/permissions/users/<user>/prompts-patterns`
+  and the group equivalent). See [Permissions → Prompts](permissions#prompts).
+
+- **`TRUSTED_PROXIES` unset now trusts no proxy.** Previously an unset `TRUSTED_PROXIES` honoured
+  `X-Forwarded-*` headers from every client. Now they are ignored unless the connecting client is
+  inside one of the listed ranges. A deployment behind a reverse proxy that relied on the old
+  default must set `TRUSTED_PROXIES` to the proxy's address or CIDR range; otherwise a deployment
+  mounted under a prefix (`X-Forwarded-Prefix`) no longer routes under that prefix, redirect and
+  callback URLs built from the request use the internal scheme and host (unless
+  `OIDC_REDIRECT_URI` is set), and the SCIM failed-authentication limit and its audit events see
+  the proxy's address as the client IP. See [Reverse proxies](#reverse-proxies).
+- **The SCIM client IP comes from the trusted proxy.** Behind a proxy listed in
+  `TRUSTED_PROXIES`, the SCIM failed-authentication limit and its audit events are now keyed on
+  the client address taken from `X-Forwarded-For` (right-most untrusted entry) or `X-Real-IP`,
+  rather than on the proxy's address. The connection address (`request.client`) is unchanged.
+- **Workspaces are resolved on the routed path.** With `MLFLOW_ENABLE_WORKSPACES=true`, the
+  workspace of a request is resolved on the path the router dispatches — the request path with a
+  trusted forwarded prefix removed — the same path authorization decides on.
 
 - **Session tokens move off the cookie.** The refresh token, ID token, and IdP expiry that used
   to live in the signed session cookie now live encrypted on the server-side `auth_sessions` row
@@ -351,9 +682,190 @@ upgrade.
   `allow_tokens_without_expiry: true` on that provider's registry entry before upgrading, or those
   callers start getting `401`. See [Provider registry fields](#provider-registry-fields) and
   [Kubernetes service accounts](kubernetes-auth#tokens-without-an-expiry).
+- **Identity claims missing from the ID token are read from the UserInfo endpoint.** A browser
+  login whose ID token lacks the username or display name now asks the provider's UserInfo
+  endpoint for them, with the login's access token, so providers that release email or name only
+  there can sign users in. The ID token's claims still take precedence, and the username an ID
+  token already yields does not change. Authorization is unchanged for existing deployments: the
+  groups and workspace claims still come from the ID token alone unless you set the new
+  `OIDC_USERINFO_GROUPS` (registry: `userinfo_groups`). A login whose UserInfo response carries a
+  different or no `sub` is refused, including one that previously succeeded without UserInfo
+  (for example, with only the display name missing). Deployments whose ID tokens carry the
+  username and display name make no extra request. See
+  [Claims and the UserInfo endpoint](#claims-and-the-userinfo-endpoint).
+- **Public clients (`OIDC_PUBLIC_CLIENT`, `public_client`).** An OIDC client can now be
+  registered without a client secret, as a public client authenticated by PKCE, when it is
+  declared so explicitly. Nothing changes for an existing deployment: a client with a secret
+  registers exactly as before, and a client without one is still not registered — the error
+  logged for it now says to set the secret or declare the client public. See
+  [Public clients](#public-clients).
+- **Outbound HTTPS trusts the operating system's certificate store.** A private or
+  TLS-inspection (DLP/DPI) root CA installed system-wide is now trusted by every call to an
+  identity provider, without extra configuration:
+  - OIDC discovery, token and userinfo requests (via `httpx2`) verify against the operating
+    system's store.
+  - Bearer-token discovery and JWKS fetches, SAML metadata, and the bundled Entra group plugin
+    verify against the operating system's store *in addition to* certifi's bundled list, or to
+    `REQUESTS_CA_BUNDLE` when it is set, as before.
+  - The Kubernetes provider's cluster CA is still trusted on its own, never combined with either.
+  If your private root is only in `REQUESTS_CA_BUNDLE`, also install it system-wide (or set
+  `SSL_CERT_FILE`) so the login flow trusts it too.
+- **Bearer tokens are verified with `joserfc`.** Token validation moved from the deprecated
+  `authlib.jose` module to `joserfc`, which is now a direct dependency. Accepted algorithms, the
+  `iss`, `aud`, `exp`, `nbf` and `iat` checks, `kid` selection and the key refresh on a failed
+  signature are unchanged. A few malformed tokens that were accepted before are now refused: one
+  signed with a key whose JWKS entry names a different `alg` than the token's header, one whose
+  registered header parameters have the wrong type or form (a non-string `kid` or `typ`, a
+  `jku` that is not an http(s) URL, a non-boolean `b64`), and one whose signature segment
+  carries base64 padding. Standards-conforming identity providers issue none of these.
+- **Artifact paths that name no experiment are denied.** The artifact proxy used to authorize a
+  path it could not map to an experiment with `DEFAULT_MLFLOW_PERMISSION`. On a deployment that sets
+  it to `MANAGE` (the shipped default before v7.6.0), any authenticated user could download, upload to or
+  delete the artifact root (`DELETE /api/2.0/mlflow-artifacts/artifacts/.` emptied every
+  experiment's artifacts) and list every experiment id. Such paths now get `403` for every
+  method. Listing the root still works, but it returns only the experiments the caller can read.
+  This is a behaviour change only if you run `DEFAULT_MLFLOW_PERMISSION=MANAGE` (or any level
+  above `NO_PERMISSIONS`). MLflow's own client and UI are unaffected when experiment artifact
+  locations sit directly under the proxy root (`mlflow-artifacts:/<experiment_id>` or
+  `mlflow-artifacts:/workspaces/<ws>/<experiment_id>`, MLflow's default layout). **If your
+  artifact root or a workspace's `default_artifact_root` adds a prefix** (for example
+  `--default-artifact-root mlflow-artifacts:/mlartifacts`, giving
+  `mlflow-artifacts:/mlartifacts/<experiment_id>`), the plugin cannot tell which experiment such a
+  path belongs to, and non-admin artifact uploads, downloads and listings through the proxy are
+  now denied. Before, they were allowed for everyone, including other tenants. Keep experiment
+  locations at the top of the proxy root to use the proxy as a non-admin. A tool that wrote to or
+  deleted the artifact root as a non-admin must now run as an administrator. On a `NO_PERMISSIONS` deployment these requests
+  were already denied, and nothing changes except that the root listing is now filtered rather
+  than refused. The logged-model artifact routes and the run presigned-URL routes are also
+  authorized now; before, they had no check. See [Artifact Access](permissions#artifact-access).
+
+  **Artifacts-only servers** (`mlflow server --artifacts-only`, or any artifact proxy whose
+  tracking store has no experiment table or cannot be reached) are affected too. An artifact
+  path is now authorized only after the plugin confirms, in the tracking store, that the
+  experiment it names exists. A server that cannot answer that denies all non-admin proxy
+  traffic, and logs the store error. Keep the tracking store reachable from the artifact
+  server, or route non-admin artifact traffic through the tracking server.
+
+- **Some requests also need a grant on the resource they reference.** Creating a model version
+  needs READ on the run, logged model, experiment or registered model its `source`, `run_id`
+  and `model_id` point at; logging a metric to a logged model (`LogMetric` / `LogBatch` with
+  `model_id`) and minting a presigned upload URL for a logged model need EDIT on that logged
+  model's experiment; creating or updating a gateway model definition needs USE on its secret;
+  creating or updating a gateway endpoint, or attaching a model to one, needs USE on every model
+  definition it routes to, and EDIT on the experiment named in `experiment_id`. Admins are
+  unaffected. With `DEFAULT_MLFLOW_PERMISSION=MANAGE` most users already hold these grants. With
+  the default `NO_PERMISSIONS` (which also applies to a deployment upgraded from before v7.6.0
+  that never set the variable), grant them before upgrading. See
+  [Resources a request references](permissions#resources-a-request-references).
+- **Model version sources are checked.** A model version whose `source` is a storage location
+  (`s3://`, `gs://`, a local path, a URL other than the artifact proxy) must lie under the
+  artifact root of the `run_id` or `model_id` the request names; with neither id, creating it
+  is admin-only. A prompt version's source must be MLflow's placeholder (`dummy-source` or
+  `prompt-template`, which MLflow's own clients send) unless it follows the same rules. A client
+  that registers models from arbitrary storage locations, or creates prompt versions with
+  another placeholder, must run as an administrator or send the source through a run or
+  logged model. See [Creating a model version](permissions#creating-a-model-version).
+- **Routes without a validator are refused to non-admins.** A request to an MLflow route that
+  has no authorization rule now gets `403` for a non-admin user instead of being served. Admins
+  are unaffected. See [Routes without a validator](permissions#routes-without-a-validator).
+- **GenAI routes now need experiment grants.** Evaluation datasets, issues, label schemas,
+  review queues, UI jobs, scorer online-scoring configuration, `issues/invoke` and
+  `genai/evaluate/invoke` now check the permission of the
+  experiment they belong to. A non-admin needs the grant listed in
+  [Experiment-scoped GenAI routes](permissions#experiment-scoped-genai-routes); with
+  `DEFAULT_MLFLOW_PERMISSION=MANAGE` most users already hold it, and with the default
+  `NO_PERMISSIONS` it has to be granted. Requests that name no
+  experiment (an unscoped dataset or issue search, a dataset linked to no experiment, a job with
+  no recorded experiment) are admin-only. Gateway budget reads (`gateway/budgets/get`, `list`,
+  `windows`) and demo-data generation are admin-only.
+- **Job API jobs belong to their creator.** On MLflow's FastAPI job API
+  (`/ajax-api/3.0/jobs/…`), fetching or cancelling a job by id now requires being the user who
+  submitted it, and `jobs/search` returns only the caller's own jobs. Previously any
+  authenticated user could do both for every job. Jobs with no recorded creator (submitted
+  before MLflow recorded one, or on an MLflow release that does not) are visible to admins only.
+  Submitting a job (`POST /ajax-api/3.0/jobs/`) now requires the permissions its parameters
+  call for: EDIT on every experiment the job acts on, directly or through a run or trace. A job
+  function the plugin does not classify is admin-only. Previously any authenticated user could
+  submit any allowed job with any parameters. MLflow's own UI starts these jobs through
+  experiment-scoped routes, which are unchanged.
+  Admins are unaffected. See [Job API](permissions#job-api).
+- **Creating a prompt optimization job checks the prompt and dataset.**
+  `POST 3.0/mlflow/prompt-optimization/jobs` now needs EDIT on the source prompt, which the job
+  registers a new version of, and READ on the experiments of the training dataset, in addition
+  to EDIT on the experiment. A `source_prompt_uri` that is not a `prompts:/` URI, or a dataset
+  that cannot be resolved, is refused. Admins are unaffected.
+- **`ListScorers` is filtered per scorer.** Listing scorers without an `experiment_id`, which
+  MLflow answers with the scorers of every active experiment, is now allowed for any
+  authenticated user instead of being refused, and both forms of the request omit scorers the
+  caller cannot read: a scorer needs READ on its experiment, and a `NO_PERMISSIONS` grant on the
+  scorer itself hides it. Admins are unaffected.
+- **Review queues and label schemas follow MLflow's own authorization rules.** Creating,
+  updating or deleting a label schema needs MANAGE on the experiment (before: EDIT to create or
+  update). Opening a review queue (`get`, `get-by-name`, `items/list`) needs, besides READ,
+  MANAGE, being assigned to the queue, or EDIT and owning it. Updating a queue needs MANAGE, or
+  EDIT and ownership (before: any EDIT user). Removing items needs MANAGE, or EDIT and ownership
+  of a custom queue (before: any EDIT user). Submitting a review (`items/set-status`) needs EDIT
+  and being assigned to the queue, for every non-admin including one with MANAGE. The queue
+  list shows a READ-only user only the queues they are assigned to. A custom queue can no longer
+  be created with, or renamed to, a registered username, by anyone including an administrator.
+  One operation becomes available: the EDIT owner of a custom queue may now delete it (before:
+  MANAGE only). See [Experiment-scoped GenAI routes](permissions#experiment-scoped-genai-routes).
 - **The `[saml]` extra is optional.** SAML support (see [SAML Authentication](saml-auth)) ships
   behind `pip install "mlflow-oidc-auth[saml]"`. A deployment that does not install it or
   configure a `saml` provider is unaffected — nothing here changes its behaviour.
+- **Trash cleanup no longer hard-deletes a run whose artifacts could not be removed.**
+  `POST /oidc/trash/cleanup` used to log a warning and hard-delete the run's metadata anyway when
+  artifact deletion failed, orphaning the artifacts. It also could not resolve a run whose
+  artifact URI used the proxied `mlflow-artifacts:` scheme, which always failed on a server (the
+  process-global tracking URI there is the backend-store URI, not an HTTP endpoint) — that failure
+  is now fixed by resolving such URIs against `--artifacts-destination`, the same way MLflow's own
+  server does. When artifact deletion still fails for some other reason, the run's metadata is now
+  kept and the failure is reported in the response's `failed_runs` list instead of being silently
+  discarded. Before hard-deleting an experiment, cleanup now always confirms it owns no run at
+  all (for any reason a run was kept, not only a failed artifact deletion — hard-deleting the
+  experiment would otherwise cascade-delete that run's metadata through MLflow's own
+  experiment/run relationship); an experiment that still owns a run is kept too and reported in
+  `failed_experiments` instead. A deployment that automates cleanup and only checks the HTTP
+  status code should also check those lists; runs and experiments that fail to clean up stay in
+  the trash instead of disappearing with orphaned artifacts.
+- **Cleanup with only `run_ids` no longer sweeps every other trashed experiment.** Calling
+  `POST /oidc/trash/cleanup?run_ids=...` without `experiment_ids` used to also hard-delete every
+  experiment in the deleted lifecycle stage (and, through it, every run of those experiments too)
+  as a side effect, regardless of `older_than`. It now touches only the named runs. The next
+  bullets cover the changes to calls that name `experiment_ids` or name neither. See
+  [Trash Management](api-reference#trash-management).
+- **Cleanup with only `experiment_ids` no longer deletes every other trashed run.** Calling
+  `POST /oidc/trash/cleanup?experiment_ids=...` without `run_ids` — what the UI's "delete selected
+  experiments" sends — used to also hard-delete every run in the deleted lifecycle stage, in any
+  experiment, with its artifacts. It now deletes only the named experiments and their own runs;
+  trashed runs elsewhere stay restorable (#484). On a tracking store that cannot hard-delete
+  experiments, such a call now lists the named experiments in `failed_experiments`
+  (`Store cannot permanently delete experiments`) instead of answering as if they were deleted.
+- **Trash cleanup fails when it cannot look up its candidates.** When a lookup of trashed runs
+  or experiments failed (including a later page of one), an "empty trash" call used to answer 200
+  having deleted only part of the trash, and a call with `older_than` reported every run as "not
+  older than". It now answers 500 (`Failed to retrieve deleted runs` or
+  `Failed to retrieve deleted experiments`) and deletes nothing.
+- **An empty `run_ids=` or `experiment_ids=` no longer empties the trash.** A parameter that is
+  present but names nothing used to be read as absent, so `?run_ids=` emptied the whole trash.
+  It now deletes nothing; only a call with neither parameter empties the trash. Repeated ids are
+  handled once.
+- **Trash cleanup's 500 body is `{"error": ...}`.** It was `{"detail": ...}`, unlike the
+  endpoint's 400 and 404. A client that reads `detail` from a cleanup 500 should read `error`.
+- **Listing deleted runs fails instead of showing part of the trash.** On a store without MLflow's
+  deleted-runs lookup, `GET /oidc/trash/runs` used to show an empty or partial list when a page of
+  the search failed. It now answers 500 `Failed to retrieve deleted runs`.
+- **Trash cleanup failure reasons are fixed strings.** The `error` of each `failed_runs` /
+  `failed_experiments` entry is now one of `Failed to delete artifacts`, `Failed to delete run`,
+  `Run not found`, `Could not verify no runs remain`, `Failed to delete experiment`, or one of the
+  existing lifecycle/age reasons, instead of the underlying exception text. The exception is still
+  written to the server log. Automation that matched on exception text should match on these
+  reasons instead.
+- **Redis cache URL and some MLflow settings are no longer logged.** The cache factory no longer
+  writes `CACHE_REDIS_URL` (which can carry a password) to the log, and
+  `configure_mlflow_environment()` / `mlflow-oidc-server` now log only the name of each MLflow
+  variable it sets, not its value. `mlflow-oidc-server --show-config` and `--dry-run` still print
+  values, but mask the password of any `scheme://user:password@` URI in them.
 
 ## MLflow Server Environment Variables
 
@@ -382,10 +894,21 @@ OIDC_CLIENT_SECRET=dev-secret
 SECRET_KEY=dev-not-for-production
 ```
 
+or, for a public client that has no client secret — declared with `OIDC_PUBLIC_CLIENT`, and
+authenticated by PKCE, which is on by default (see [Public clients](#public-clients)):
+
+```bash
+# .env file
+OIDC_DISCOVERY_URL=https://your-idp.example.com/.well-known/openid-configuration
+OIDC_CLIENT_ID=mlflow-dev-public
+OIDC_PUBLIC_CLIENT=true
+SECRET_KEY=dev-not-for-production
+```
+
 ### Security-First Production Setup
 
 ```bash
-# Deny all access by default — require explicit permission grants
+# Deny by default (the shipped default since v7.6.0); shown here so it is explicit
 DEFAULT_MLFLOW_PERMISSION=NO_PERMISSIONS
 
 # Strict group requirements
@@ -404,7 +927,7 @@ SESSION_COOKIE_MAX_AGE_SECONDS=0
 SESSION_COOKIE_SAMESITE=strict
 SESSION_COOKIE_SECURE=true
 
-# Disable API docs
+# API docs stay off (the default); shown here so it is explicit
 ENABLE_API_DOCS=false
 
 # Auto-redirect to OIDC login

@@ -6,7 +6,7 @@ to the default MLflow server when OIDC authentication is required.
 """
 
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import AsyncIterator
 
 from fastapi import APIRouter, FastAPI
 from mlflow.server import app
@@ -27,6 +27,7 @@ from mlflow_oidc_auth.middleware import (
     WorkspaceContextMiddleware,
     add_fastapi_permission_middleware,
 )
+from mlflow_oidc_auth.middleware.route_path import static_prefix_conflicts
 from mlflow_oidc_auth.oauth import ensure_all_clients_registered
 from mlflow_oidc_auth.routers import ajax_alias_router, get_all_routers
 
@@ -84,15 +85,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if failed:
         logger.warning(
             "OIDC client registration failed at startup for: %s. "
-            "This may indicate missing configuration (OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_DISCOVERY_URL, "
-            "or OIDC_CLIENT_SECRET_<PROVIDER_ID> for an additional provider). "
+            "This may indicate missing configuration (OIDC_CLIENT_ID, OIDC_DISCOVERY_URL, and a client secret: "
+            "OIDC_CLIENT_SECRET, or OIDC_CLIENT_SECRET_<PROVIDER_ID> for an additional provider). A provider without a "
+            'secret must be declared a public client (OIDC_PUBLIC_CLIENT=true, or "public_client": true on its registry '
+            "entry), which also requires PKCE (OIDC_CODE_CHALLENGE) and no secret. An error logged for each such provider names the setting to change. "
             "Those providers will not be available until configuration is corrected.",
             ", ".join(sorted(failed)),
         )
     if not results:
         logger.warning(
             "No OIDC client was registered at startup. "
-            "This may indicate missing configuration (OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_DISCOVERY_URL). "
+            "This may indicate missing configuration (OIDC_CLIENT_ID, OIDC_DISCOVERY_URL, and either OIDC_CLIENT_SECRET "
+            "or OIDC_PUBLIC_CLIENT=true for a public client). "
             "OIDC authentication will not be available until configuration is corrected."
         )
 
@@ -205,6 +209,44 @@ def _include_mlflow_fastapi_routers(oidc_app: FastAPI) -> None:
         logger.debug("mlflow.server.mcp_server_api not available — MCP registry endpoints disabled")
 
 
+def add_middleware_stack(oidc_app: FastAPI) -> None:
+    """Install the plugin's middleware on ``oidc_app`` in its required order.
+
+    Kept separate from ``create_app`` so tests exercise exactly this order.
+
+    Parameters:
+        oidc_app: The FastAPI application to configure.
+    """
+    # ---------------------------------------------------------------------------
+    # Middleware ordering (Starlette executes LAST-added as OUTERMOST):
+    #
+    #   Request → ProxyHeaders → Session → WorkspaceContext → Auth
+    #             → PermissionMiddleware → route handler
+    #
+    # ProxyHeaders MUST be OUTERMOST so the forwarded prefix it records in
+    # scope["root_path"] is known before AuthMiddleware and PermissionMiddleware
+    # decide anything: both make their decisions on the routed path (the path
+    # with root_path removed, which is what the router dispatches on).
+    #
+    # PermissionMiddleware MUST be added FIRST (innermost) so it runs AFTER
+    # AuthMiddleware has set request.state.username / is_admin.
+    #
+    # Session must wrap Auth, which reads request.session.
+    # ---------------------------------------------------------------------------
+    add_fastapi_permission_middleware(oidc_app)
+    oidc_app.add_middleware(AuthMiddleware)
+    oidc_app.add_middleware(WorkspaceContextMiddleware)
+    oidc_app.add_middleware(
+        StarletteSessionMiddleware,
+        secret_key=config.SECRET_KEY,
+        session_cookie=config.SESSION_COOKIE_NAME,
+        max_age=config.SESSION_COOKIE_MAX_AGE_SECONDS,
+        same_site=config.SESSION_COOKIE_SAMESITE,
+        https_only=config.SESSION_COOKIE_SECURE,
+    )
+    oidc_app.add_middleware(ProxyHeadersMiddleware)
+
+
 def create_app() -> FastAPI:
     """Create a FastAPI application with OIDC integration.
 
@@ -222,34 +264,23 @@ def create_app() -> FastAPI:
     )
     register_exception_handlers(oidc_app)
 
-    # ---------------------------------------------------------------------------
-    # Middleware ordering (Starlette executes LAST-added as OUTERMOST):
-    #
-    #   Request → Session → WorkspaceContext → Auth → ProxyHeaders
-    #             → PermissionMiddleware → route handler
-    #
-    # PermissionMiddleware MUST be added FIRST (innermost) so it runs AFTER
-    # AuthMiddleware has set request.state.username / is_admin.
-    # ---------------------------------------------------------------------------
-    add_fastapi_permission_middleware(oidc_app)
-    oidc_app.add_middleware(ProxyHeadersMiddleware)
-    oidc_app.add_middleware(AuthMiddleware)
-    oidc_app.add_middleware(WorkspaceContextMiddleware)
-    oidc_app.add_middleware(
-        StarletteSessionMiddleware,
-        secret_key=config.SECRET_KEY,
-        session_cookie=config.SESSION_COOKIE_NAME,
-        max_age=config.SESSION_COOKIE_MAX_AGE_SECONDS,
-        same_site=config.SESSION_COOKIE_SAMESITE,
-        https_only=config.SESSION_COOKIE_SECURE,
-    )
+    conflicts = static_prefix_conflicts()
+    if conflicts:
+        logger.error(
+            "MLflow's static prefix covers the plugin's unauthenticated routes %s; they will require a signed-in user. Choose a static prefix that does not overlap them.",
+            ", ".join(conflicts),
+        )
+
+    add_middleware_stack(oidc_app)
 
     for router in get_all_routers():
         _include_router(oidc_app, router)
 
     # Inject into MLflow's index.html when the menu links or the re-auth helper
     # are enabled. Both live in the same hack module to keep injection ordering
-    # predictable.
+    # predictable. The admin-page redirect rides along with them and never turns
+    # the injection on by itself, so a deployment that switched both off keeps
+    # MLflow's index untouched.
     if config.EXTEND_MLFLOW_MENU or config.EXTEND_MLFLOW_REAUTH:
         from mlflow_oidc_auth import hack
 
@@ -262,9 +293,19 @@ def create_app() -> FastAPI:
     app.before_request(before_request_hook)
     app.after_request(after_request_hook)
 
+    # Grants on name-keyed resources carry the resource's workspace; give one to any recorded before
+    # they did. Runs on every start, workspaces enabled or not, and never raises.
+    from mlflow_oidc_auth.grant_workspace_backfill import backfill_grant_workspaces
+
+    backfill_grant_workspaces()
+
     # Seed default workspace and register workspace routers when workspaces are enabled (WSFND-04)
     if config.MLFLOW_ENABLE_WORKSPACES:
         _seed_default_workspace()
+        # A lowered WORKSPACE_RULES_MAX_PERMISSION takes effect on grants rules already made (#418).
+        from mlflow_oidc_auth.workspace_rules import enforce_ceiling
+
+        enforce_ceiling()
         # Register all workspace routers only when workspaces are enabled
         from mlflow_oidc_auth.routers.workspace_permissions import (
             workspace_permissions_router,

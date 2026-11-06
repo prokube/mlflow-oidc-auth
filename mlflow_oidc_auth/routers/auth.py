@@ -5,14 +5,13 @@ This router handles OIDC authentication flows including login, logout, and callb
 """
 
 import asyncio
-import secrets
 import time
 from collections.abc import Awaitable
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from urllib.parse import urlencode, urlparse
 
-from authlib.jose.errors import BadSignatureError
+from joserfc.errors import BadSignatureError
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
@@ -28,8 +27,12 @@ from mlflow_oidc_auth.repository.auth_session import REFRESH_GUARD_TIMEOUT_SECON
 from mlflow_oidc_auth.session.refresh_lock import local_refresh_turn
 from mlflow_oidc_auth.session.token_vault import SessionTokens, get_token_vault
 from mlflow_oidc_auth.store import store
-from mlflow_oidc_auth.utils import get_configured_or_dynamic_redirect_uri, extract_username, extract_display_name
+from mlflow_oidc_auth.utils import get_configured_or_dynamic_redirect_uri, extract_username, extract_display_name, call_group_detection_plugin
+from mlflow_oidc_auth.group_patterns import BY_PATTERN, admitting_rule, normalize_group_values
 
+from mlflow_oidc_auth.models.system import AuthProvidersResponse, AuthStatusResponse
+
+from ._openapi import REDIRECT_RESPONSES
 from ._prefix import UI_ROUTER_PREFIX
 
 logger = get_logger()
@@ -492,7 +495,7 @@ def _interactive_provider(provider_id: str):
     return None
 
 
-@auth_router.get(PROVIDERS)
+@auth_router.get(PROVIDERS, response_model=AuthProvidersResponse)
 async def providers(request: Request):
     """List the providers a browser may log in with (#317's login picker reads this).
 
@@ -531,8 +534,8 @@ def _login_path(request: Request, path: str) -> str:
 
     ``root_path`` is included so a deployment mounted under a prefix gets a URL that resolves.
     It is dropped when it does not look like a path, because it is not always the mount:
-    ``ProxyHeadersMiddleware`` also sets it from ``X-Forwarded-Prefix``, which is trusted from
-    any client while ``TRUSTED_PROXIES`` is empty. A value beginning with ``//`` would otherwise
+    ``ProxyHeadersMiddleware`` also sets it from ``X-Forwarded-Prefix`` when the connecting client
+    is a proxy listed in ``TRUSTED_PROXIES``. A value beginning with ``//`` would otherwise
     make this return a protocol-relative URL — ``//evil.example/login/entra`` is off-origin the
     moment a browser resolves it, which is the one thing this function promises cannot happen.
     A prefix that has to be discarded means a broken link, not a login somewhere else.
@@ -543,7 +546,7 @@ def _login_path(request: Request, path: str) -> str:
     return f"{root_path.rstrip('/')}{path}"
 
 
-@auth_router.get(f"{LOGIN}/{{provider_id}}")
+@auth_router.get(f"{LOGIN}/{{provider_id}}", response_class=RedirectResponse, status_code=302, responses=REDIRECT_RESPONSES)
 async def login_with_provider(request: Request, provider_id: str):
     """Begin a login against a named provider (#316).
 
@@ -561,7 +564,7 @@ async def login_with_provider(request: Request, provider_id: str):
     return await _begin_login(request, provider_id)
 
 
-@auth_router.get(LOGIN)
+@auth_router.get(LOGIN, response_class=RedirectResponse, status_code=302, responses=REDIRECT_RESPONSES)
 async def login(request: Request):
     """The legacy login, which is the ``default`` provider's.
 
@@ -594,9 +597,6 @@ async def _begin_login(request: Request, provider_id: str):
                 status_code=500,
                 detail="OIDC authentication not available - configuration error",
             )
-
-        # Get session for storing OAuth state (using Starlette's built-in session)
-        session = request.session
 
         # Capture an optional ?next= return target so the callback can return the user to where
         # they were before the session expired. Validated to be a same-origin relative path;
@@ -787,7 +787,7 @@ async def _provider_metadata(client) -> dict:
             if isinstance(loaded, dict):
                 return loaded
         except Exception as exc:
-            logger.debug("Could not load provider metadata for logout: %s", type(exc).__name__)
+            logger.debug("Could not load provider metadata: %s", type(exc).__name__)
     metadata = getattr(client, "server_metadata", None)
     return metadata if isinstance(metadata, dict) else {}
 
@@ -874,7 +874,7 @@ async def _named_provider_end_session_url(request: Request, provider_id: str, to
     return f"{end_session_endpoint}?{urlencode(logout_params)}"
 
 
-@auth_router.get(LOGOUT)
+@auth_router.get(LOGOUT, response_class=RedirectResponse, status_code=302, responses=REDIRECT_RESPONSES)
 async def logout(request: Request):
     """
     Handle user logout.
@@ -990,7 +990,7 @@ async def logout(request: Request):
         return RedirectResponse(url=auth_url, status_code=302)
 
 
-@auth_router.get(f"{CALLBACK}/{{provider_id}}")
+@auth_router.get(f"{CALLBACK}/{{provider_id}}", response_class=RedirectResponse, status_code=302, responses=REDIRECT_RESPONSES)
 async def callback_for_provider(request: Request, provider_id: str):
     """Complete a login that began at ``/login/{provider_id}`` (#316).
 
@@ -1002,7 +1002,7 @@ async def callback_for_provider(request: Request, provider_id: str):
     return await _complete_login(request, provider_id)
 
 
-@auth_router.get(CALLBACK)
+@auth_router.get(CALLBACK, response_class=RedirectResponse, status_code=302, responses=REDIRECT_RESPONSES)
 async def callback(request: Request):
     """The legacy callback, for a login that began at ``/login``.
 
@@ -1129,7 +1129,7 @@ def _session_provider_display_name(resolved) -> str:
     return config.OIDC_PROVIDER_DISPLAY_NAME
 
 
-@auth_router.get(AUTH_STATUS)
+@auth_router.get(AUTH_STATUS, response_model=AuthStatusResponse)
 async def auth_status(request: Request):
     """
     Get current authentication status.
@@ -1164,6 +1164,19 @@ async def auth_status(request: Request):
     except Exception as e:
         logger.error(f"Error getting auth status: {e}")
         raise HTTPException(status_code=500, detail="Failed to get authentication status")
+
+
+def _is_service_account(username: str) -> bool:
+    """Whether ``username`` names an existing service account."""
+    from mlflow.exceptions import MlflowException
+    from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST, ErrorCode
+
+    try:
+        return store.get_user_profile(username).is_service_account is True
+    except MlflowException as e:
+        if e.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST):
+            return False
+        raise
 
 
 def _account_is_inactive(username: str) -> bool:
@@ -1229,8 +1242,10 @@ def _provision_login(
     # Whether this provider may confer administrator rights at all, and whether these
     # claims do (#318). ``admin_source: none`` is the answer for a partner tenant whose
     # group names you do not control; the admin group name itself stays server-side.
+    user_groups = normalize_group_values(user_groups)
     is_admin = admin_from_claims(provider, user_groups, config.OIDC_ADMIN_GROUP_NAME)
-    if not is_admin and not any(group in user_groups for group in config.OIDC_GROUP_NAME):
+    admission = None if is_admin else admitting_rule(user_groups, config.OIDC_GROUP_NAME, config.OIDC_GROUP_NAME_PATTERN)
+    if not is_admin and admission is None:
         errors.append("User is not allowed to login")
         return None, errors
 
@@ -1283,6 +1298,7 @@ def _provision_login(
         derived_username=username,
         user_exists=store.has_user,
         providers_bound_to=_providers_bound_to,
+        providers_in_domain=lambda domain: store.user_identity_repo.providers_in_email_domain(domain),
     )
     if not outcome.allowed:
         logger.warning("Refusing login via provider '%s': %s", provider.id, outcome.reason)
@@ -1298,6 +1314,22 @@ def _provision_login(
         return None, errors
 
     username = outcome.username or username
+
+    # A service account never signs in interactively: an internal one signs in with the tokens
+    # issued for it, an external one with its provider's tokens (utils/service_accounts.py). A
+    # person whose claims name one must not land in it.
+    if _is_service_account(username):
+        logger.warning("Refusing login via provider '%s': the account is a service account", provider.id)
+        emit_audit_event(
+            "auth.identity_refused",
+            actor=username,
+            resource_type="user",
+            resource_id=username,
+            detail={"provider": provider.id, "reason": "service account"},
+            status="denied",
+        )
+        errors.append("This account cannot be used to sign in here")
+        return None, errors
 
     # A deactivated account completes nothing. Checked before any write: otherwise the login
     # would refresh the row's admin flag, groups and workspaces and open a session that the
@@ -1356,8 +1388,17 @@ def _provision_login(
         is_new_user=outcome.create,
     )
     if groups is not None:
-        user_module.populate_groups(group_names=groups)
-        user_module.update_user(username=username, group_names=groups)
+        arrived = user_module.populate_groups(group_names=groups, written_by=f"{method}:{provider.id}")
+        # Attributed to the provider (#360): the memberships this creates are owned by it, and an
+        # authoritative sync removes only what the guard lets it — its own rows and unowned
+        # ``manual`` ones everywhere, another source's only outside ``enforce``.
+        user_module.update_user(username=username, group_names=groups, written_by=f"{method}:{provider.id}")
+        # Groups this login created get their workspace group rules (#418). Never raises: a rule
+        # failure is logged and audited, and the login goes on.
+        if arrived:
+            from mlflow_oidc_auth.workspace_rules import apply_rules_for_groups
+
+            apply_rules_for_groups(arrived, source=f"{method}:{provider.id}")
 
     # Workspace detection (per D-07, D-08, WSOIDC-01/02/03)
     # Layered approach: plugin first, JWT claim fallback, then auto-assign
@@ -1427,8 +1468,208 @@ def _provision_login(
                 # Permission already exists — not an error (idempotent)
                 logger.debug(f"Workspace permission already exists for {username} in '{ws_name}'")
 
+    if admission is not None and admission.kind == BY_PATTERN:
+        # A pattern admits groups nobody listed by name (#78), so say which one let this user in.
+        # Recorded only once the login has succeeded, naming the account it reached.
+        logger.info("Login of %s admitted by OIDC_GROUP_NAME_PATTERN %r (group %r)", username, admission.rule, admission.group)
+        emit_audit_event(
+            "auth.admitted_by_group_pattern",
+            actor=username,
+            resource_type="user",
+            resource_id=username,
+            detail={"provider": provider.id, "method": method, "pattern": admission.rule, "group": admission.group},
+        )
+
     logger.info(f"User {username} successfully processed with groups: {user_groups}")
     return username, []
+
+
+# Claims that describe the authentication event rather than the user. They are only meaningful in
+# the signed, nonce-bound ID token, so a UserInfo response never supplies them — even when the ID
+# token happens to lack one. ``sub`` is here too: it is compared, never copied.
+_ID_TOKEN_ONLY_CLAIMS = frozenset(
+    {
+        "iss",
+        "sub",
+        "aud",
+        "exp",
+        "iat",
+        "nbf",
+        "nonce",
+        "azp",
+        "at_hash",
+        "c_hash",
+        "s_hash",
+        "sid",
+        "auth_time",
+        "acr",
+        "amr",
+        "jti",
+        "cnf",
+    }
+)
+
+# Claims that only mean something together. ``email_verified`` from UserInfo next to an ``email``
+# from the ID token would vouch for an address the provider may not have verified, so a pair is
+# taken from UserInfo whole or not at all.
+_COUPLED_CLAIMS = (("email", "email_verified"), ("phone_number", "phone_number_verified"))
+
+
+def _authorization_claims() -> set[str]:
+    """The claims that decide access rather than identity: the groups and workspace claims."""
+    return {config.OIDC_GROUPS_ATTRIBUTE, config.OIDC_WORKSPACE_CLAIM_NAME}
+
+
+def _claims_the_login_lacks(id_claims: dict[str, Any], userinfo_groups: bool = False) -> list[str]:
+    """The claims this login reads that the validated ID token does not carry and UserInfo may supply.
+
+    A claim counts as present when the login can use it as delivered: the username and display
+    name when their extraction succeeds, the groups and workspace claims when the key is there at
+    all. The groups and workspace claims count only when the provider opts in with
+    ``userinfo_groups`` (``OIDC_USERINFO_GROUPS``) — they decide access, so by default they come
+    from the ID token alone. Even then, the groups claim is only needed when no group detection
+    plugin is configured, and the workspace claim only when workspaces are enabled without a
+    detection plugin — those are the only paths that read them.
+
+    Parameters:
+        id_claims: The validated ID token claims.
+        userinfo_groups: Whether the provider lets UserInfo supply the groups and workspace claims.
+
+    Returns:
+        Short labels of the missing claims, for logging; empty when the ID token suffices.
+    """
+    missing: list[str] = []
+    if extract_username(id_claims)[1]:
+        missing.append("username")
+    if extract_display_name(id_claims)[1]:
+        missing.append("display_name")
+    if not userinfo_groups:
+        return missing
+    if not config.OIDC_GROUP_DETECTION_PLUGIN and config.OIDC_GROUPS_ATTRIBUTE not in id_claims:
+        missing.append("groups")
+    if config.MLFLOW_ENABLE_WORKSPACES and not config.OIDC_WORKSPACE_DETECTION_PLUGIN and config.OIDC_WORKSPACE_CLAIM_NAME not in id_claims:
+        missing.append("workspace")
+    return missing
+
+
+def _merge_userinfo_claims(id_claims: dict[str, Any], userinfo_claims: dict[str, Any], userinfo_groups: bool = False) -> dict[str, Any]:
+    """Fill the claims the ID token lacks from a UserInfo response already bound to its ``sub``.
+
+    The ID token is signed and bound to this login attempt by its nonce, so it always wins: a
+    UserInfo value is used only for a claim the ID token does not carry, never one describing the
+    authentication itself (``_ID_TOKEN_ONLY_CLAIMS``), and a coupled pair only when the ID token
+    carries neither half. The groups and workspace claims are taken only when the provider opts in.
+
+    Parameters:
+        id_claims: The validated ID token claims.
+        userinfo_claims: The UserInfo response, whose ``sub`` the caller has checked.
+        userinfo_groups: Whether the provider lets UserInfo supply the groups and workspace claims.
+
+    Returns:
+        A new dict: the ID token claims plus what UserInfo was allowed to add.
+    """
+    merged = dict(id_claims)
+    blocked = set(_ID_TOKEN_ONLY_CLAIMS)
+    if not userinfo_groups:
+        blocked.update(_authorization_claims())
+    for pair in _COUPLED_CLAIMS:
+        if any(claim in id_claims for claim in pair):
+            blocked.update(pair)
+    for claim, value in userinfo_claims.items():
+        if not isinstance(claim, str) or claim in blocked or claim in merged:
+            continue
+        merged[claim] = value
+    return merged
+
+
+async def _fetch_userinfo_claims(client, provider_id: str, token_response: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Call the provider's UserInfo endpoint with this login's access token.
+
+    The request goes through the provider's own authlib client, so it uses that client's HTTP
+    stack, TLS settings and timeouts. Only a plain JSON object is accepted: authlib parses the
+    body as JSON, so a signed or encrypted (``application/jwt``) response fails to parse and is
+    treated like any other failure rather than decoded without verification.
+
+    The client is handed the access token alone — no refresh token, no expiry. authlib refreshes a
+    token it considers about to expire (within 60 seconds) before sending the request, and would
+    discard the result: with a provider that rotates refresh tokens, that spends the refresh token
+    this session is about to store, and the session's first real refresh is then refused as a
+    reuse. A just-issued access token that the provider rejects is simply a failed call.
+
+    Parameters:
+        client: The authlib client the authorization code was exchanged with.
+        provider_id: The provider's registry id, for logging.
+        token_response: The token response carrying the access token.
+
+    Returns:
+        The response claims, or None when the endpoint is not advertised or the call failed.
+    """
+    metadata = await _provider_metadata(client)
+    endpoint = metadata.get("userinfo_endpoint")
+    if not isinstance(endpoint, str) or not endpoint:
+        logger.debug("Provider '%s' advertises no userinfo_endpoint; using the ID token claims alone", provider_id)
+        return None
+    access_token = token_response.get("access_token")
+    if not isinstance(access_token, str) or not access_token or not callable(getattr(client, "userinfo", None)):
+        logger.debug("Cannot call the UserInfo endpoint of provider '%s'; using the ID token claims alone", provider_id)
+        return None
+    token_type = token_response.get("token_type")
+    bearer_only = {"access_token": access_token, "token_type": token_type if isinstance(token_type, str) and token_type else "Bearer"}
+    try:
+        response = await _maybe_await(client.userinfo(token=bearer_only))
+    except Exception as exc:
+        logger.warning("UserInfo request to provider '%s' failed (%s); using the ID token claims alone", provider_id, type(exc).__name__)
+        return None
+    if not isinstance(response, dict):
+        logger.warning("UserInfo response from provider '%s' is not a JSON object; using the ID token claims alone", provider_id)
+        return None
+    return dict(response)
+
+
+async def _claims_for_login(
+    client,
+    provider_id: str,
+    token_response: dict[str, Any],
+    id_claims: dict[str, Any],
+    userinfo_groups: bool = False,
+) -> tuple[Optional[dict[str, Any]], bool]:
+    """The claims this login uses: the ID token's, completed from UserInfo when it lacks some.
+
+    UserInfo is consulted only when a claim the login reads is missing from the ID token and the
+    provider advertises a ``userinfo_endpoint``. OpenID Connect Core 5.3.2 requires the response's
+    ``sub`` to equal the ID token's; a response without one, or with another, refuses the login —
+    it describes some other user. Without an ID token ``sub`` there is nothing to bind a response
+    to, so UserInfo is not used at all.
+
+    Parameters:
+        client: The authlib client the authorization code was exchanged with.
+        provider_id: The provider's registry id.
+        token_response: The token response carrying the access token.
+        id_claims: The validated ID token claims.
+        userinfo_groups: Whether the provider lets UserInfo supply the groups and workspace claims.
+
+    Returns:
+        ``(claims, True)`` to proceed with ``claims``; ``(None, False)`` when the login must be refused.
+    """
+    missing = _claims_the_login_lacks(id_claims, userinfo_groups)
+    if not missing:
+        return id_claims, True
+
+    id_subject = id_claims.get("sub")
+    if not isinstance(id_subject, str) or not id_subject:
+        logger.info("ID token from provider '%s' has no subject to bind a UserInfo response to; using the ID token claims alone", provider_id)
+        return id_claims, True
+
+    userinfo_claims = await _fetch_userinfo_claims(client, provider_id, token_response)
+    if userinfo_claims is None:
+        return id_claims, True
+
+    if userinfo_claims.get("sub") != id_subject:
+        logger.warning("UserInfo response from provider '%s' does not carry the ID token's subject; refusing the login", provider_id)
+        return None, False
+
+    logger.debug("Completed claims %s from the UserInfo endpoint of provider '%s'", missing, provider_id)
+    return _merge_userinfo_claims(id_claims, userinfo_claims, userinfo_groups), True
 
 
 async def _process_oidc_callback_fastapi(request: Request, session, provider_id: Optional[str] = None) -> tuple[Optional[str], list[str]]:
@@ -1537,24 +1778,41 @@ async def _process_oidc_callback_fastapi(request: Request, session, provider_id:
             errors.append("Failed to exchange authorization code")
             return None, errors
 
-        # Validate the token and get user info
+        # authlib puts the validated ID token's claims under ``userinfo`` — it does not call the
+        # UserInfo endpoint. Those claims are the base; the endpoint only fills what they lack.
         access_token = token_response.get("access_token")
-        id_token = token_response.get("id_token")
-        userinfo = token_response.get("userinfo")
+        id_claims = token_response.get("userinfo")
 
-        if not userinfo:
+        if not id_claims:
             errors.append("No user information received")
             return None, errors
 
-        # Extract user details using utility functions
-        username, username_error = extract_username(userinfo)
+        userinfo, proceed = await _claims_for_login(
+            exchange_client,
+            provider.id,
+            token_response,
+            dict(id_claims),
+            userinfo_groups=getattr(provider, "userinfo_groups", False) is True,
+        )
+        if not proceed or userinfo is None:
+            errors.append("User information from the identity provider does not match the signed-in user")
+            return None, errors
+
+        # Extract user details using utility functions. The username and display name come from
+        # the ID token whenever it yields them, so completing other claims from UserInfo can never
+        # change which configured field — and so which account — a login resolves to.
+        username, username_error = extract_username(id_claims)
+        if username_error:
+            username, username_error = extract_username(userinfo)
         if username_error:
             errors.append(username_error)
             return None, errors
 
         # A missing display name doesn't block login — fall back to the username,
         # matching the bearer-token provisioning path (auth_middleware.py).
-        display_name, display_name_error = extract_display_name(userinfo)
+        display_name, display_name_error = extract_display_name(id_claims)
+        if display_name_error:
+            display_name, display_name_error = extract_display_name(userinfo)
         if display_name_error:
             logger.debug("Falling back to username as display name for %s: %s", username, display_name_error)
             display_name = username
@@ -1563,18 +1821,18 @@ async def _process_oidc_callback_fastapi(request: Request, session, provider_id:
         try:
             # Use module-level config (possibly patched in tests). User management goes through
             # the mlflow_oidc_auth.user module inside _provision_login so test monkeypatches apply.
-            import importlib
 
-            # Get user groups
+            # Get user groups. A plugin that declares a ``token_response`` parameter also
+            # receives the full authlib token response (id_token, access_token, userinfo, ...);
+            # a plugin written against the original single-argument signature is unaffected (#250).
             if config.OIDC_GROUP_DETECTION_PLUGIN:
-                user_groups = importlib.import_module(config.OIDC_GROUP_DETECTION_PLUGIN).get_user_groups(access_token)
+                user_groups = call_group_detection_plugin(config.OIDC_GROUP_DETECTION_PLUGIN, access_token, token_response)
             else:
                 user_groups = userinfo.get(config.OIDC_GROUPS_ATTRIBUTE, [])
 
-            # With jumpcloud, if the groups attribute is a single group, it will be sent as a string.
-            # To process the groups correctly, bring the group into a list of groups.
-            if isinstance(user_groups, str):
-                user_groups = [user_groups]
+            # A lone group arrives as a string (JumpCloud); non-string and empty entries are
+            # dropped, so an unusable claim admits nobody (#78).
+            user_groups = normalize_group_values(user_groups)
 
             logger.debug(f"User groups: {user_groups}")
 

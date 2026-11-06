@@ -17,7 +17,6 @@ worth nothing unless a command proves it.**
 | `web-react/AGENTS.md` | every agent tool | Frontend detail; wins for files beneath it |
 | [`CLAUDE.md`](../CLAUDE.md) | Claude Code | Thin `@AGENTS.md` import plus Claude-specific pointers |
 | `.github/copilot-instructions.md` | GitHub Copilot | Pointer to `AGENTS.md` |
-| `.claude/settings.json` | Claude Code | **Enforced** permissions — not advice |
 | `.claude/agents/` | Claude Code | Read-only subagents for parallel investigation |
 | `.claude/commands/` | Claude Code | `/agent-task`, `/verify`, `/spec-issue` |
 | `.github/ISSUE_TEMPLATE/agent-task.yml` | humans and agents | The executable-issue contract |
@@ -50,10 +49,10 @@ roadmap is GitHub issues; project constraints are in `AGENTS.md`.
 The distinction that matters: **a skill teaches, a hook enforces, a subagent isolates.** Markdown
 is guidance the model may or may not follow; settings are rules the tool enforces.
 
-Corollary worth internalizing: **anything that must not happen belongs in `.claude/settings.json`,
-not in `AGENTS.md`.** Deny rules are evaluated first and beat everything, including a hook that
-says allow. A file denied at the tool layer is effectively invisible — strictly better than asking
-the model nicely not to read it.
+This repository ships no project `.claude/settings.json`, so the rules in `AGENTS.md` are
+guidance, backed by review and CI rather than by tool-layer permissions. A contributor who wants
+something enforced for their own sessions can put deny rules in their user or local Claude Code
+settings, which are not checked in.
 
 ### Subagent fan-out
 
@@ -129,7 +128,7 @@ altering the release path unreviewed is its own risk:
 |---|---|---|
 | `permissions: write-all` | `pypi.yml`, `pypi-test.yml` | The publish job holds far more than it needs. Scope to `contents: write` plus `id-token: write` for trusted publishing. |
 | `pull_request_target` on a code scanner | `bandit.yml` | Under `pull_request_target` the default checkout is the **base** ref, so the PR's changes are likely never scanned — security theater. If it were changed to check out the head, it would become the classic pwn-request. `actions/checkout` v7 refuses that pattern by default as of June 2026. |
-| Third-party actions pinned by tag | several workflows | `gsactions/commit-message-checker@v2`, `cycjimmy/semantic-release-action@v6`, `amannn/action-semantic-pull-request@v6`, `SonarSource/sonarqube-scan-action@v7.0.0`, `PyCQA/bandit-action@v1.0.1` — a moved tag is a supply-chain compromise. Pin to SHA with Dependabot. |
+| Third-party actions pinned by tag | several workflows | `cycjimmy/semantic-release-action@v6`, `amannn/action-semantic-pull-request@v6`, `SonarSource/sonarqube-scan-action@v8.2.2`, `PyCQA/bandit-action@v1.0.1` (`webiny/action-conventional-commits` is already pinned to a commit SHA) — a moved tag is a supply-chain compromise. Pin to SHA with Dependabot. |
 | Action pinned to a **branch** | `pypa/gh-action-pypi-publish@release/v1` | Mutable ref in the publish path. |
 | No repository-wide default | all workflows | No top-level `permissions: {}` to make grants explicit per job. |
 
