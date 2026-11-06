@@ -14,6 +14,7 @@ from joserfc.errors import BadSignatureError
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from mlflow_oidc_auth.config import config
 from mlflow_oidc_auth.routers.auth import (
     AUTH_STATUS,
     CALLBACK,
@@ -80,6 +81,35 @@ class TestBuildUIUrl:
         result = _build_ui_url(request, "/home")
 
         assert result == "http://localhost:8000/oidc/ui/home"
+
+    def test_configured_redirect_uri_supplies_public_base(self, mock_request_with_session, monkeypatch):
+        """A fixed callback keeps UI redirects on the public HTTPS origin and prefix."""
+        request = mock_request_with_session()
+        request.base_url = "http://mlflow.mlflow.svc.cluster.local:8080/mlflow/"
+        monkeypatch.setattr(config, "OIDC_REDIRECT_URI", "https://mlflow.example.com/mlflow/callback")
+
+        result = _build_ui_url(request, "/auth")
+
+        assert result == "https://mlflow.example.com/mlflow/oidc/ui/auth"
+
+    @pytest.mark.parametrize(
+        "redirect_uri",
+        [
+            None,
+            "",
+            "//evil.example/callback",
+            "ftp://mlflow.example.com/mlflow/callback",
+            "https://mlflow.example.com/mlflow/not-callback",
+        ],
+    )
+    def test_invalid_configured_redirect_uri_falls_back_to_request(self, mock_request_with_session, monkeypatch, redirect_uri):
+        request = mock_request_with_session()
+        request.base_url = "http://localhost:8000/"
+        monkeypatch.setattr(config, "OIDC_REDIRECT_URI", redirect_uri)
+
+        result = _build_ui_url(request, "/auth")
+
+        assert result == "http://localhost:8000/oidc/ui/auth"
 
 
 class TestLoginEndpoint:
@@ -192,9 +222,11 @@ class TestLogoutEndpoint:
     """Test the logout endpoint functionality."""
 
     @pytest.mark.asyncio
-    async def test_logout_with_oidc_provider_logout(self, mock_request_with_session, mock_oauth):
+    async def test_logout_with_oidc_provider_logout(self, mock_request_with_session, mock_oauth, monkeypatch):
         """Test logout with OIDC provider logout support."""
         request = mock_request_with_session({"username": "test@example.com", "authenticated": True})
+        request.base_url = "http://mlflow.mlflow.svc.cluster.local:8080/mlflow/"
+        monkeypatch.setattr(config, "OIDC_REDIRECT_URI", "https://mlflow.example.com/mlflow/callback")
 
         with patch("mlflow_oidc_auth.routers.auth.oauth", mock_oauth):
             result = await logout(request)
@@ -209,6 +241,7 @@ class TestLogoutEndpoint:
             # client_id must be sent so providers like Keycloak do not reject the
             # logout with "Missing parameters: id_token_hint".
             assert "client_id=" in result.headers["location"]
+            assert _query(result)["post_logout_redirect_uri"] == ["https://mlflow.example.com/mlflow/oidc/ui/auth"]
 
     @pytest.mark.asyncio
     async def test_logout_without_oidc_provider_logout(self, mock_request_with_session):

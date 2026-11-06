@@ -9,7 +9,7 @@ import time
 from collections.abc import Awaitable
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, urlunparse
 
 from joserfc.errors import BadSignatureError
 from fastapi import APIRouter, HTTPException, Request
@@ -472,7 +472,7 @@ def _build_ui_url(request: Request, path: str, query_params: Optional[dict] = No
     Returns:
         Complete URL string for the UI route
     """
-    base_url = str(request.base_url).rstrip("/")
+    base_url = _configured_public_base_url(config.OIDC_REDIRECT_URI) or str(request.base_url).rstrip("/")
     url = f"{base_url}{UI_ROUTER_PREFIX}{path}"
 
     if query_params:
@@ -480,6 +480,24 @@ def _build_ui_url(request: Request, path: str, query_params: Optional[dict] = No
         url = f"{url}?{query_string}"
 
     return url
+
+
+def _configured_public_base_url(redirect_uri: Optional[str]) -> Optional[str]:
+    """Return the configured callback's public origin and deployment prefix.
+
+    ``OIDC_REDIRECT_URI`` is the trusted public callback URL for deployments that cannot safely
+    accept forwarded headers. UI redirects must use the same public base rather than the internal
+    HTTP connection seen by the application.
+    """
+    if not redirect_uri:
+        return None
+
+    parsed = urlparse(redirect_uri)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.path.endswith(CALLBACK):
+        return None
+
+    base_path = parsed.path[: -len(CALLBACK)].rstrip("/")
+    return urlunparse((parsed.scheme, parsed.netloc, base_path, "", "", "")).rstrip("/")
 
 
 def _interactive_provider(provider_id: str):
